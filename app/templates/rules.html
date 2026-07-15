@@ -1,0 +1,49 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>跟进规则</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>跟进规则</h1>
+            <p>规则只生成跟进草稿并进入系统审核，不自动连发。</p>
+          </div>
+          <a class="button secondary" href="/">返回发送工作台</a>
+        </header>
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+        <section class="panel">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>规则</th><th>未回复天数</th><th>模板</th><th>客户等级</th></tr></thead>
+              <tbody>
+                {% for rule in rules %}
+                  <tr><td>{{ rule.name }}</td><td>{{ rule.delay_days }}</td><td>{{ rule.template_id }}</td><td>{{ rule.priorities }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <form action="/followup-rules" method="post" class="form-grid">
+            <label>规则名<input name="name" value="No reply after 5 days" /></label>
+            <label>未回复几天后<input name="delay_days" type="number" value="5" /></label>
+            <label>跟进模板
+              <select name="template_id">
+                {% for template in templates %}
+                  <option value="{{ template.id }}">{{ template.name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>适用等级<input name="priorities" value="A,B,C" /></label>
+            <button type="submit">保存规则</button>
+          </form>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

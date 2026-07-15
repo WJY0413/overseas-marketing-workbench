@@ -1,0 +1,256 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>设置</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>设置</h1>
+            <p>低频配置集中放在这里，工作台只保留日常发送动作。</p>
+            <div class="version-line">
+              <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
+              <span>版本 {{ app_version }}</span>
+              <span>{{ "演练模式" if settings.dry_run_email else "真实发送模式" }}</span>
+            </div>
+          </div>
+          <a class="button secondary" href="/">返回工作台</a>
+        </header>
+
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>运行模式</h2>
+              <p>测试时使用演练模式；确认无误后再切换真实发送。</p>
+            </div>
+          </div>
+          <form action="/settings/send-mode" method="post" class="form-grid">
+            <label>发送模式
+              <select name="dry_run_email">
+                <option value="true" {% if settings.dry_run_email %}selected{% endif %}>演练模式</option>
+                <option value="false" {% if not settings.dry_run_email %}selected{% endif %}>真实发送</option>
+              </select>
+            </label>
+            <button class="{{ 'danger' if settings.dry_run_email else 'secondary' }}" type="submit">保存模式</button>
+            <a class="button secondary" href="/reports/sending.xlsx">导出发送报告</a>
+          </form>
+          <div class="settings-note">
+            <strong>数据目录</strong>
+            <span>{{ settings.data_dir }}</span>
+          </div>
+        </section>
+
+        <section class="panel" id="signature-module">
+          <div class="panel-head">
+            <div>
+              <h2>签名模块</h2>
+              <p>导入 Word 签名模板后，系统会在草稿生成、入队和发送前自动追加签名。</p>
+            </div>
+          </div>
+          <form action="/settings/signature/import-docx" method="post" enctype="multipart/form-data" class="form-grid wide">
+            <label>导入 Word 签名模板<input type="file" name="file" accept=".docx" required /></label>
+            <button type="submit">导入签名</button>
+            <a class="button secondary" href="/templates#signature-template">在邮件模板页编辑签名</a>
+          </form>
+          <div class="template-preview signature-import-preview">
+            <h3>导入后的效果</h3>
+            <div class="preview-body signature-preview-body">{{ signature_preview_html | safe }}</div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>发件邮箱</h2>
+              <p>邮箱、额度、窗口和间隔会影响发送队列。保存窗口后，该邮箱现有待发送队列会按新窗口重新排程；窗口按本机时间执行，支持跨午夜，例如服务英国区可设 17:00-02:00。</p>
+            </div>
+          </div>
+          <div class="notice">建议：常规 BD 邮件默认 30 封/天；新邮箱先按 20-30 封/天。</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>邮箱</th><th>今日额度</th><th>建议量</th><th>设置</th><th>编辑</th></tr></thead>
+              <tbody>
+                {% for item in sender_usage %}
+                  {% set is_no_delay = item.sender.random_delay_min_seconds == 0 and item.sender.random_delay_max_seconds == 0 %}
+                  {% set is_fixed_delay = item.sender.random_delay_min_seconds == item.sender.random_delay_max_seconds and not is_no_delay %}
+                  <tr>
+                    <td>{{ item.sender.email }}<br><small>{{ item.sender.name }} / {{ "启用" if item.sender.is_active else "停用" }}</small></td>
+                    <td>{{ item.sent_today }}/{{ item.sender.daily_limit }}，剩余 {{ item.remaining }}</td>
+                    <td><strong>{{ item.advice.recommended_daily_limit }}/天</strong><br><small>{{ item.advice.provider }}；警戒线 {{ item.advice.caution_daily_limit }}/天</small></td>
+                    <td>
+                      <small>SMTP：{{ item.sender.smtp_host }}:{{ item.sender.smtp_port }}</small><br>
+                      <small>窗口：{{ item.sender.window_start.strftime('%H:%M') }} - {{ item.sender.window_end.strftime('%H:%M') }}{% if item.sender.window_start > item.sender.window_end %}（跨午夜）{% endif %}</small><br>
+                      {% if is_no_delay %}<small>间隔：不加额外延迟</small>{% elif is_fixed_delay %}<small>间隔：固定 {{ item.sender.random_delay_min_seconds }} 秒</small>{% else %}<small>间隔：随机 {{ item.sender.random_delay_min_seconds }}-{{ item.sender.random_delay_max_seconds }} 秒</small>{% endif %}
+                      <form action="/senders/{{ item.sender.id }}/window" method="post" class="inline-window-form">
+                        <input name="window_start" type="time" value="{{ item.sender.window_start.strftime('%H:%M') }}" aria-label="窗口开始" />
+                        <input name="window_end" type="time" value="{{ item.sender.window_end.strftime('%H:%M') }}" aria-label="窗口结束" />
+                        <button class="secondary" type="submit">保存窗口</button>
+                      </form>
+                    </td>
+                    <td>
+                      <details class="sender-editor">
+                        <summary>编辑邮箱</summary>
+                        <form action="/senders/{{ item.sender.id }}/settings" method="post" class="form-grid sender-edit-grid">
+                          <label>显示名<input name="name" value="{{ item.sender.name }}" required /></label>
+                          <label>邮箱<input name="email" type="email" value="{{ item.sender.email }}" required /></label>
+                          <label>SMTP Host<input name="smtp_host" value="{{ item.sender.smtp_host }}" required /></label>
+                          <label>SMTP Port<input name="smtp_port" type="number" value="{{ item.sender.smtp_port }}" /></label>
+                          <label>SMTP Username<input name="smtp_username" value="{{ item.sender.smtp_username or '' }}" /></label>
+                          <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="{{ '已加密保存，留空则不修改' if item.sender.smtp_password_encrypted else '输入后加密保存' }}" /></label>
+                          <label>密码环境变量（备用）<input name="password_env" value="{{ item.sender.password_env or '' }}" placeholder="SMTP_PASSWORD_PRIMARY" /></label>
+                          <label>单日上限<input name="daily_limit" type="number" min="1" max="10000" value="{{ item.sender.daily_limit }}" /></label>
+                          <label>窗口开始<input name="window_start" type="time" value="{{ item.sender.window_start.strftime('%H:%M') }}" /></label>
+                          <label>窗口结束<input name="window_end" type="time" value="{{ item.sender.window_end.strftime('%H:%M') }}" /></label>
+                          <label>间隔策略
+                            <select name="interval_mode">
+                              <option value="random" {% if not is_no_delay and not is_fixed_delay %}selected{% endif %}>随机间隔</option>
+                              <option value="fixed" {% if is_fixed_delay %}selected{% endif %}>固定间隔</option>
+                              <option value="none" {% if is_no_delay %}selected{% endif %}>不加额外延迟</option>
+                            </select>
+                          </label>
+                          <label>最小随机延迟秒<input name="random_delay_min_seconds" type="number" value="{{ item.sender.random_delay_min_seconds }}" /></label>
+                          <label>最大随机延迟秒<input name="random_delay_max_seconds" type="number" value="{{ item.sender.random_delay_max_seconds }}" /></label>
+                          <label>固定延迟秒<input name="fixed_delay_seconds" type="number" value="{{ item.sender.random_delay_min_seconds if is_fixed_delay else 300 }}" /></label>
+                          <label class="checkbox-line"><input name="enable_open_tracking" type="checkbox" value="true" {% if item.sender.enable_open_tracking %}checked{% endif %} /> 打开追踪</label>
+                          <label class="checkbox-line"><input name="is_active" type="checkbox" value="true" {% if item.sender.is_active %}checked{% endif %} /> 启用该邮箱</label>
+                          <button type="submit">保存邮箱</button>
+                        </form>
+                      </details>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>新增发件邮箱</h2>
+              <p>SMTP 密码会在本机后端加密保存，页面不会回显明文。环境变量仅作为备用方式；发送窗口按本机时间填写，可跨午夜。</p>
+            </div>
+          </div>
+          <form action="/senders" method="post" class="form-grid">
+            <label>显示名<input name="name" value="{{ settings.default_sender_name }}" required /></label>
+            <label>邮箱<input name="email" type="email" required /></label>
+            <label>SMTP Host<input name="smtp_host" required /></label>
+            <label>SMTP Port<input name="smtp_port" type="number" value="465" /></label>
+            <label>SMTP Username<input name="smtp_username" /></label>
+            <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="输入后加密保存" /></label>
+            <label>密码环境变量（备用）<input name="password_env" placeholder="SMTP_PASSWORD_PRIMARY" /></label>
+            <label>单日上限<input name="daily_limit" type="number" value="{{ default_recommended_daily_limit }}" min="1" max="10000" /></label>
+            <label>窗口开始<input name="window_start" type="time" value="09:30" /></label>
+            <label>窗口结束<input name="window_end" type="time" value="17:30" /></label>
+            <label>间隔策略
+              <select name="interval_mode">
+                <option value="random" selected>随机间隔</option>
+                <option value="fixed">固定间隔</option>
+                <option value="none">不加额外延迟</option>
+              </select>
+            </label>
+            <label>最小随机延迟秒<input name="random_delay_min_seconds" type="number" value="180" /></label>
+            <label>最大随机延迟秒<input name="random_delay_max_seconds" type="number" value="600" /></label>
+            <label>固定延迟秒<input name="fixed_delay_seconds" type="number" value="300" /></label>
+            <label class="checkbox-line"><input name="enable_open_tracking" type="checkbox" value="true" /> 打开追踪</label>
+            <button type="submit">保存邮箱</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>高级维护</h2>
+              <p>这些不是每天要用的入口，保留在这里避免干扰发送流程。</p>
+            </div>
+          </div>
+          <div class="inline-actions">
+            <a class="button secondary" href="/rules">跟进规则</a>
+            <a class="button secondary" href="/compliance">黑名单 / 退订</a>
+            <form action="/queue/process" method="post"><button class="secondary" type="submit">处理到期队列</button></form>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script>
+      document.querySelectorAll(".signature-form").forEach((form) => {
+        const editor = form.querySelector(".rich-editor");
+        const htmlInput = form.querySelector(".rich-html-input");
+        const imageButton = form.querySelector(".insert-image-button");
+        const imageInput = form.querySelector(".rich-image-input");
+        const maxImageBytes = 1.5 * 1024 * 1024;
+        function syncRichEditor() {
+          if (!editor || !htmlInput) return;
+          htmlInput.value = editor.innerHTML.trim();
+        }
+        function insertImageDataUrl(dataUrl, fileName) {
+          if (!editor) return;
+          const img = document.createElement("img");
+          img.src = dataUrl;
+          img.alt = fileName || "";
+          img.style.maxWidth = "100%";
+          img.style.height = "auto";
+          img.style.display = "block";
+          img.style.margin = "8px 0";
+          editor.focus();
+          const selection = window.getSelection();
+          if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+            const range = selection.getRangeAt(0);
+            range.deleteContents();
+            range.insertNode(img);
+            range.setStartAfter(img);
+            range.collapse(true);
+            selection.removeAllRanges();
+            selection.addRange(range);
+          } else {
+            editor.appendChild(img);
+          }
+          syncRichEditor();
+        }
+        function insertImageFile(file) {
+          if (!file || !file.type.startsWith("image/")) return;
+          if (file.size > maxImageBytes) {
+            alert("图片过大。建议压缩到 1.5 MB 以内再插入。");
+            return;
+          }
+          const reader = new FileReader();
+          reader.addEventListener("load", function () {
+            insertImageDataUrl(reader.result, file.name);
+          });
+          reader.readAsDataURL(file);
+        }
+        if (editor && htmlInput) {
+          editor.addEventListener("input", syncRichEditor);
+          editor.addEventListener("paste", function (event) {
+            const imageFile = Array.from(event.clipboardData?.files || []).find((file) => file.type.startsWith("image/"));
+            if (imageFile) {
+              event.preventDefault();
+              insertImageFile(imageFile);
+              return;
+            }
+            setTimeout(syncRichEditor, 0);
+          });
+          syncRichEditor();
+        }
+        if (imageButton && imageInput) {
+          imageButton.addEventListener("click", function () {
+            imageInput.click();
+          });
+          imageInput.addEventListener("change", function () {
+            Array.from(imageInput.files || []).forEach(insertImageFile);
+            imageInput.value = "";
+          });
+        }
+        form.addEventListener("submit", syncRichEditor);
+      });
+    </script>
+  </body>
+</html>

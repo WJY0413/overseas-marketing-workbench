@@ -1,0 +1,689 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>工作台</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>工作台</h1>
+            <p>按客户准备、生成草稿、开始发送三个步骤处理 BD 邮件。</p>
+            <div class="version-line">
+              <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
+              <span>版本 {{ app_version }}</span>
+              <span>{{ "演练模式" if settings.dry_run_email else "真实发送模式" }}</span>
+              {% if queue_state.status != "idle" %}<span class="badge queued">队列{{ queue_state.label }}</span>{% endif %}
+              <span id="time-check" data-server-now="{{ server_now.isoformat() }}">电脑时间检测中...</span>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <span id="computer-clock" class="clock-pill">电脑时间：--:--:--</span>
+            <a class="button secondary" href="/settings">设置</a>
+          </div>
+        </header>
+
+        {% if message %}<div class="notice page-notice">{{ message }}</div>{% endif %}
+
+        <section id="dashboard" class="metrics">
+          <div class="metric"><span>准备区客户</span><strong>{{ draftable_contacts | length }}</strong></div>
+          <div class="metric"><span>可发送草稿</span><strong>{{ stats.approved }}</strong></div>
+          <div class="metric"><span>待发送队列</span><strong>{{ stats.queued }}</strong></div>
+          <div class="metric"><span>需处理草稿</span><strong>{{ stats.audit_exceptions }}</strong></div>
+          <div class="metric"><span>今日已发送</span><strong>{{ stats.sent_today }}</strong></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>1. 准备客户</h2>
+              <p>导入新客户，或从 CRM 按跟进状态筛选后加入准备区。</p>
+            </div>
+            <a class="button secondary" href="/crm">查看 CRM</a>
+          </div>
+          <form action="/import" method="post" enctype="multipart/form-data" class="form-grid">
+            <label>BD Excel 文件<input type="file" name="file" accept=".xlsx,.xlsm" required /></label>
+            <button type="submit">解析 BD Excel 并导入</button>
+          </form>
+          <details class="template-editor">
+            <summary>从 CRM 选择客户</summary>
+            <form method="get" action="/" class="form-grid wide">
+              <label>跟进状态
+                <select name="crm_followup">
+                  <option value="never" {% if crm_filters.followup == "never" %}selected{% endif %}>未跟进</option>
+                  <option value="contacted" {% if crm_filters.followup == "contacted" %}selected{% endif %}>已跟进</option>
+                  <option value="all" {% if crm_filters.followup == "all" %}selected{% endif %}>全部</option>
+                </select>
+              </label>
+              <label>上次跟进早于<input type="date" name="crm_last_before" value="{{ crm_filters.last_before }}" /></label>
+              <label>上次跟进晚于<input type="date" name="crm_last_after" value="{{ crm_filters.last_after }}" /></label>
+              <label>国家<input name="crm_country" value="{{ crm_filters.country }}" placeholder="Thailand" /></label>
+              <label>等级<input name="crm_priority" value="{{ crm_filters.priority }}" placeholder="A / B / C" /></label>
+              <button class="secondary" type="submit">筛选 CRM 客户</button>
+            </form>
+            <form action="/draft-prep/add-from-crm" method="post">
+              <div class="bulk-actions">
+                <label class="checkbox-line"><input type="checkbox" id="select-all-crm-candidates" /> 全选筛选结果</label>
+                <button type="submit">加入准备区</button>
+                <small>当前结果：{{ crm_candidate_contacts | length }} 个联系人</small>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>选择</th><th>公司</th><th>联系人</th><th>邮箱</th><th>国家</th><th>区域</th><th>等级</th><th>跟进状态</th><th>最近跟进</th></tr></thead>
+                  <tbody>
+                    {% for contact in crm_candidate_contacts %}
+                      {% set company = company_by_id.get(contact.company_id) %}
+                      {% if company %}
+                        <tr>
+                          <td><input class="crm-candidate-checkbox" type="checkbox" name="contact_ids" value="{{ contact.id }}" /></td>
+                          <td>{{ company.name }}</td>
+                          <td>{{ contact.full_name }}<br><small>{{ contact.position or "-" }}</small></td>
+                          <td>{{ contact.email }}</td>
+                          <td>{{ company.country or "-" }}</td>
+                          <td>{{ company.region or "-" }}</td>
+                          <td><span class="badge">{{ company.priority }}</span></td>
+                          <td>{{ "未跟进" if not company.last_contact_at else "已跟进" }}</td>
+                          <td>{{ display_dt(company.last_contact_at) }}</td>
+                        </tr>
+                      {% endif %}
+                    {% endfor %}
+                    {% if not crm_candidate_contacts %}
+                      <tr><td colspan="9">当前筛选条件下没有可加入准备区的 CRM 联系人。</td></tr>
+                    {% endif %}
+                  </tbody>
+                </table>
+              </div>
+            </form>
+          </details>
+          <details class="template-editor">
+            <summary>手动添加客户</summary>
+            <form action="/draft-prep/add" method="post" class="form-grid wide">
+              <label>公司<input name="company" required /></label>
+              <label>联系人<input name="full_name" required /></label>
+              <label>职位<input name="position" /></label>
+              <label>邮箱<input name="email" type="email" required /></label>
+              <label>国家<input name="country" /></label>
+              <label>区域<input name="region" placeholder="Scotland" /></label>
+              <label>等级<input name="priority" value="B" /></label>
+              <button type="submit">加入准备区</button>
+            </form>
+          </details>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>2. 生成草稿</h2>
+              <p>只选择模板和客户。模板新增、导入、编辑统一放在邮件模板页。</p>
+            </div>
+            <a class="button secondary" href="/templates">管理模板</a>
+          </div>
+          <form id="draft-generate-form" action="/drafts/generate" method="post">
+            <div class="form-grid">
+              <label>邮件模板
+                <select name="template_id" id="template-select">
+                  {% if not active_templates %}
+                    <option value="" selected disabled>没有启用模板</option>
+                  {% endif %}
+                  {% for template in active_templates %}
+                    <option value="{{ template.id }}" data-subject="{{ template.subject | e }}" data-body="{{ template.body_html | e }}" data-cc="{{ (template.cc_emails or '') | e }}" data-cc-enabled="{{ 'yes' if template.cc_enabled else 'no' }}">{{ template.name }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <button type="submit" id="generate-drafts-button">生成草稿</button>
+              <button class="secondary" type="button" id="select-all-draft-prep">全选准备区</button>
+              <button class="secondary" type="submit" formaction="/draft-prep/clear">清空准备区</button>
+            </div>
+          </form>
+          <p id="draft-generate-progress" class="muted"></p>
+          <div class="template-preview" id="template-preview">
+            <h3>模板预览</h3>
+            <p><strong>Subject：</strong><span id="template-preview-subject">-</span></p>
+            <p><strong>CC：</strong><span id="template-preview-cc">-</span></p>
+            <div class="preview-body" id="template-preview-body">请选择模板。</div>
+          </div>
+          <div class="template-preview signature-confirm-panel" id="signature-confirm-panel">
+            <div class="panel-head">
+              <div>
+                <h3>签名确认</h3>
+                <p>生成草稿前确认国家、区域、发件邮箱和电话的最终签名效果。</p>
+              </div>
+              <a class="button secondary" href="/settings#signature-module">编辑签名</a>
+            </div>
+            <div class="signature-preview-grid">
+              <div class="signature-preview-controls">
+                <label>预览客户
+                  <select id="signature-preview-contact">
+                    {% if not draftable_contacts %}
+                      <option value="">准备区暂无客户</option>
+                    {% endif %}
+                    {% for contact in draftable_contacts %}
+                      {% set company = company_by_id.get(contact.company_id) %}
+                      {% if company %}
+                        <option value="{{ contact.id }}">{{ company.name }} / {{ contact.full_name }} / {{ company.country or "-" }}</option>
+                      {% endif %}
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>预览发件邮箱
+                  <select id="signature-preview-sender">
+                    <option value="">未选择发件邮箱（使用默认显示邮箱）</option>
+                    {% for sender in senders %}
+                      {% if sender.is_active %}
+                        <option value="{{ sender.id }}">{{ sender.email }}</option>
+                      {% endif %}
+                    {% endfor %}
+                  </select>
+                </label>
+                <button class="secondary" type="button" id="signature-preview-from-checked">用第一个已勾选客户预览</button>
+                <div class="signature-field-list">
+                  <span>区域：<strong id="signature-preview-region">-</strong></span>
+                  <span>邮箱：<strong id="signature-preview-email">-</strong></span>
+                  <span>电话：<strong id="signature-preview-phone">-</strong></span>
+                  <span>国家：<strong id="signature-preview-country">-</strong></span>
+                </div>
+              </div>
+              <div class="preview-body signature-preview-body" id="signature-preview-body">请选择客户查看签名。</div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>选择</th><th>公司</th><th>联系人</th><th>职位</th><th>邮箱</th><th>国家</th><th>区域</th><th>等级</th><th>最近跟进</th><th>操作</th></tr></thead>
+              <tbody>
+                {% for contact in draftable_contacts %}
+                  {% set company = company_by_id.get(contact.company_id) %}
+                  {% if contact.status == "active" and company %}
+                    <tr>
+                      <td><input class="draft-prep-checkbox" type="checkbox" name="contact_ids" value="{{ contact.id }}" form="draft-generate-form" checked /></td>
+                      <td>{{ company.name }}</td>
+                      <td>{{ contact.full_name }}{% if contact.is_primary %}<br><small>主联系人</small>{% endif %}</td>
+                      <td>{{ contact.position or "-" }}</td>
+                      <td>{{ contact.email }}</td>
+                      <td>{{ company.country or "-" }}</td>
+                      <td>{{ company.region or "-" }}</td>
+                      <td><span class="badge">{{ company.priority }}</span></td>
+                      <td>{{ display_dt(company.last_contact_at) }}</td>
+                      <td>
+                        <button
+                          class="secondary draft-prep-edit-toggle"
+                          type="button"
+                          data-contact-id="{{ contact.id }}"
+                          data-company="{{ company.name | e }}"
+                          data-full-name="{{ contact.full_name | e }}"
+                          data-position="{{ (contact.position or '') | e }}"
+                          data-email="{{ contact.email | e }}"
+                          data-country="{{ (company.country or '') | e }}"
+                          data-region="{{ (company.region or '') | e }}"
+                          data-priority="{{ company.priority | e }}"
+                        >编辑</button>
+                        <form id="prep-remove-{{ contact.id }}" action="/draft-prep/{{ contact.id }}/remove" method="post"></form>
+                        <button class="secondary" type="submit" form="prep-remove-{{ contact.id }}">移除</button>
+                      </td>
+                    </tr>
+                  {% endif %}
+                {% endfor %}
+                {% if not draftable_contacts %}
+                  <tr><td colspan="10">准备区暂无客户。导入客户或从 CRM 加入客户后再生成草稿。</td></tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel start-panel">
+          <div class="panel-head">
+            <div>
+              <h2>发送主控台</h2>
+              <p>主按钮按真实队列状态切换：无队列时开始发送，有队列时停止或继续。</p>
+            </div>
+          </div>
+          <div class="queue-console">
+            <div class="queue-console-item">
+              <span>当前发送状态</span>
+              <strong>{{ queue_state.label }}</strong>
+            </div>
+            <div class="queue-console-item">
+              <span>待发送</span>
+              <strong>{{ queue_state.queued_count }}</strong>
+            </div>
+            <div class="queue-console-item">
+              <span>下次开始发送时间</span>
+              <strong>{{ display_dt(queue_state.next_scheduled_at) if queue_state.next_scheduled_at else "-" }}</strong>
+            </div>
+          </div>
+          <form id="queue-state-action-form" action="{{ queue_state.action_url }}" method="post"></form>
+          <form action="/send/start" method="post">
+            <div class="start-steps">
+              <div class="start-step">
+                <strong>1</strong>
+                <label>发送机制
+                  <select name="send_mode">
+                    <option value="single" selected>单发：只使用第一个选中邮箱</option>
+                    <option value="rotate">轮发：多个邮箱按顺序轮流发送</option>
+                  </select>
+                </label>
+                <label>发件邮箱
+                  <select name="sender_ids" multiple required size="3">
+                    {% for sender in senders %}
+                      {% if sender.is_active %}
+                        <option value="{{ sender.id }}">{{ sender.email }} / 每日上限 {{ sender.daily_limit }}</option>
+                      {% endif %}
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>本次发送模板
+                  <select name="send_template_id">
+                    <option value="">使用草稿当前模板</option>
+                    {% for template in active_templates %}
+                      <option value="{{ template.id }}">{{ template.name }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <small>选择模板后，会在入队前用该模板更新所选草稿内容。</small>
+              </div>
+              <div class="start-step draft-picker-step">
+                <strong>2</strong>
+                <div class="draft-picker-head">
+                  <div>
+                    <b>选择可发送草稿</b>
+                    <small>数量：{{ approved_drafts | length }}</small>
+                  </div>
+                  <label class="checkbox-line"><input type="checkbox" id="select-all-approved" /> 全选</label>
+                </div>
+              </div>
+              <div class="start-step start-action">
+                <strong>3</strong>
+                {% if queue_state.status == "idle" %}
+                  <button class="start-button" type="submit">{{ queue_state.button_label }}</button>
+                {% else %}
+                  <button class="start-button" type="submit" form="queue-state-action-form">{{ queue_state.button_label }}</button>
+                {% endif %}
+                <button class="secondary" type="submit" formaction="/drafts/bulk-delete" formnovalidate>删除所选草稿</button>
+                <label class="checkbox-line recent-override"><input name="force_recent_send" type="checkbox" value="true" /> 忽略 8 小时提醒</label>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>选择</th><th>公司</th><th>联系人</th><th>主题</th><th>CC</th><th>附件</th><th>预览</th><th>通过时间</th></tr></thead>
+                <tbody>
+                  {% for draft in approved_drafts %}
+                    {% set company = company_by_id.get(draft.company_id) %}
+                    {% set contact = contact_by_id.get(draft.contact_id) %}
+                    <tr>
+                      <td><input class="approved-draft-checkbox" type="checkbox" name="draft_ids" value="{{ draft.id }}" /></td>
+                      <td>{{ company.name if company else "-" }}</td>
+                      <td>{{ contact.full_name if contact else "-" }}<br><small>{{ contact.email if contact else "" }}</small></td>
+                      <td>{{ draft.subject }}</td>
+                      <td>{{ draft.cc_emails or "-" }}</td>
+                      <td>
+                        <form action="/drafts/{{ draft.id }}/attachments" method="post" class="compact-form">
+                          <textarea name="attachment_paths" rows="2" placeholder="每行一个本地附件绝对路径">{{ attachment_paths_text(draft.attachment_paths) }}</textarea>
+                          <button class="secondary" type="submit">保存</button>
+                        </form>
+                      </td>
+                      <td>
+                        <details class="preview">
+                          <summary>查看邮件</summary>
+                          {% if draft.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(draft.attachment_paths) }}</p>{% endif %}
+                          <div class="preview-body">{{ draft.body_html | safe }}</div>
+                        </details>
+                      </td>
+                      <td>{{ display_dt(draft.approved_at) }}</td>
+                    </tr>
+                  {% endfor %}
+                  {% if not approved_drafts %}
+                    <tr><td colspan="8">当前没有可发送草稿。先生成草稿，正常草稿会自动进入这里。</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>待发送队列</h2>
+              <p>这里显示尚未完成发送的队列。已发送记录在发送记录页查看。</p>
+            </div>
+            <div class="inline-actions">
+              <a class="button secondary" href="/send-records">发送记录</a>
+              <details class="more-actions">
+                <summary>更多操作</summary>
+                <form action="/queue/process" method="post"><button class="secondary" type="submit">处理到期队列</button></form>
+                <form action="/queue/cancel-all" method="post" onsubmit="return confirm('确认撤销全部待发送？');"><button class="danger" type="submit">撤销全部待发送</button></form>
+              </details>
+            </div>
+          </div>
+          <form method="get" action="/" class="sort-controls">
+            <input type="hidden" name="queue_view" value="{{ queue_view }}" />
+            <label>排序字段
+              <select name="queue_sort">
+                <option value="status" {% if queue_sort == "status" %}selected{% endif %}>状态优先</option>
+                <option value="company" {% if queue_sort == "company" %}selected{% endif %}>公司</option>
+                <option value="contact" {% if queue_sort == "contact" %}selected{% endif %}>联系人</option>
+              </select>
+            </label>
+            <label>方向
+              <select name="queue_dir">
+                <option value="asc" {% if queue_dir != "desc" %}selected{% endif %}>升序</option>
+                <option value="desc" {% if queue_dir == "desc" %}selected{% endif %}>降序</option>
+              </select>
+            </label>
+            <button class="secondary" type="submit">应用</button>
+          </form>
+          <form action="/queue/cancel" method="post">
+            <div class="bulk-actions">
+              <label class="checkbox-line"><input type="checkbox" id="select-all-queued" /> 全选待发送</label>
+              <button class="danger" type="submit">撤销所选</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>选择</th><th>状态</th><th>公司</th><th>联系人</th><th>发件邮箱</th><th>内容</th><th>错误</th></tr></thead>
+                <tbody>
+                  {% for draft in queue_drafts %}
+                    {% set company = company_by_id.get(draft.company_id) %}
+                    {% set contact = contact_by_id.get(draft.contact_id) %}
+                    {% set sender = senders | selectattr("id", "equalto", draft.sender_account_id) | first %}
+                    {% set preview = queue_previews.get(draft.id) %}
+                    <tr>
+                      <td>{% if draft.status == "queued" %}<input class="queued-draft-checkbox" type="checkbox" name="draft_ids" value="{{ draft.id }}" />{% else %}-{% endif %}</td>
+                      <td><span class="badge {{ draft.status }}">{{ "已暂停" if queue_paused and draft.status == "queued" else draft.status }}</span></td>
+                      <td>{{ company.name if company else "-" }}</td>
+                      <td>{{ contact.full_name if contact else "-" }}<br><small>{{ contact.email if contact else "" }}</small></td>
+                      <td>{{ sender.email if sender else "-" }}</td>
+                      <td>
+                        <details class="preview">
+                          <summary>查看邮件</summary>
+                          <p><strong>Subject：</strong>{{ preview.subject if preview else draft.subject }}</p>
+                          {% if draft.cc_emails %}<p><strong>CC：</strong>{{ draft.cc_emails }}</p>{% endif %}
+                          {% if draft.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(draft.attachment_paths) }}</p>{% endif %}
+                          <div class="preview-body">{{ (preview.body_html if preview else draft.body_html) | safe }}</div>
+                        </details>
+                      </td>
+                      <td>{{ draft.error_message or "-" }}</td>
+                    </tr>
+                  {% endfor %}
+                  {% if not queue_drafts %}
+                    <tr><td colspan="7">暂无待发送队列。</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>需处理草稿</h2>
+              <p>变量未渲染、邮箱异常、黑名单命中或正文为空的草稿会出现在这里。</p>
+            </div>
+          </div>
+          <form action="/drafts/bulk-approve" method="post">
+            <div class="bulk-actions">
+              <label class="checkbox-line"><input type="checkbox" id="select-all-exceptions" /> 全选异常草稿</label>
+              <button type="submit">标记已处理，进入可发送</button>
+              <button class="danger" type="submit" formaction="/drafts/bulk-delete">删除所选</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>选择</th><th>公司</th><th>联系人</th><th>主题</th><th>原因</th><th>附件</th><th>预览</th><th>操作</th></tr></thead>
+                <tbody>
+                  {% for draft in exception_drafts %}
+                    {% set company = company_by_id.get(draft.company_id) %}
+                    {% set contact = contact_by_id.get(draft.contact_id) %}
+                    <tr>
+                      <td><input class="exception-draft-checkbox" type="checkbox" name="draft_ids" value="{{ draft.id }}" /></td>
+                      <td>{{ company.name if company else "-" }}</td>
+                      <td>{{ contact.full_name if contact else "-" }}<br><small>{{ contact.email if contact else "" }}</small></td>
+                      <td>{{ draft.subject }}</td>
+                      <td><span class="badge pending_review">需处理</span><br><small>{{ draft.error_message or "未知异常" }}</small></td>
+                      <td>
+                        <form action="/drafts/{{ draft.id }}/attachments" method="post" class="compact-form">
+                          <textarea name="attachment_paths" rows="2" placeholder="每行一个本地附件绝对路径">{{ attachment_paths_text(draft.attachment_paths) }}</textarea>
+                          <button class="secondary" type="submit">保存</button>
+                        </form>
+                      </td>
+                      <td>
+                        <details class="preview">
+                          <summary>查看正文</summary>
+                          {% if draft.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(draft.attachment_paths) }}</p>{% endif %}
+                          <div class="preview-body">{{ draft.body_html | safe }}</div>
+                        </details>
+                      </td>
+                      <td>
+                        <div class="inline-actions">
+                          <form action="/drafts/{{ draft.id }}/approve" method="post"><button type="submit">标记已处理，进入可发送</button></form>
+                        </div>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                  {% if not exception_drafts %}
+                    <tr><td colspan="8">当前没有需处理草稿。</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
+          </form>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="draft-prep-edit-dialog" class="modal-dialog">
+      <form id="draft-prep-edit-form" method="post" class="modal-card">
+        <div class="modal-head">
+          <h3>编辑准备区客户</h3>
+          <button class="secondary icon-button" type="button" data-dialog-close aria-label="关闭">×</button>
+        </div>
+        <div class="form-grid wide">
+          <label>公司<input name="company" id="edit-company" required /></label>
+          <label>联系人<input name="full_name" id="edit-full-name" required /></label>
+          <label>职位<input name="position" id="edit-position" /></label>
+          <label>邮箱<input name="email" id="edit-email" type="email" required /></label>
+          <label>国家<input name="country" id="edit-country" /></label>
+          <label>区域<input name="region" id="edit-region" /></label>
+          <label>等级<input name="priority" id="edit-priority" /></label>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary" type="button" data-dialog-close>取消</button>
+          <button type="submit">保存修改</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script>
+      function setAll(selector, checked) {
+        document.querySelectorAll(selector).forEach((box) => { box.checked = checked; });
+      }
+      const allApproved = document.getElementById("select-all-approved");
+      if (allApproved) allApproved.addEventListener("change", () => setAll(".approved-draft-checkbox", allApproved.checked));
+      const allExceptions = document.getElementById("select-all-exceptions");
+      if (allExceptions) allExceptions.addEventListener("change", () => setAll(".exception-draft-checkbox", allExceptions.checked));
+      const allQueued = document.getElementById("select-all-queued");
+      if (allQueued) allQueued.addEventListener("change", () => setAll(".queued-draft-checkbox", allQueued.checked));
+      const allCrmCandidates = document.getElementById("select-all-crm-candidates");
+      if (allCrmCandidates) allCrmCandidates.addEventListener("change", () => setAll(".crm-candidate-checkbox", allCrmCandidates.checked));
+      const allDraftPrep = document.getElementById("select-all-draft-prep");
+      if (allDraftPrep) allDraftPrep.addEventListener("click", () => {
+        setAll(".draft-prep-checkbox", true);
+        refreshSignaturePreviewFromChecked();
+      });
+
+      const draftGenerateForm = document.getElementById("draft-generate-form");
+      const draftGenerateButton = document.getElementById("generate-drafts-button");
+      const draftGenerateProgress = document.getElementById("draft-generate-progress");
+      if (draftGenerateForm) {
+        draftGenerateForm.addEventListener("submit", async (event) => {
+          const submitter = event.submitter;
+          if (submitter && submitter.getAttribute("formaction") && submitter.getAttribute("formaction") !== "/drafts/generate") return;
+          event.preventDefault();
+          const templateId = document.getElementById("template-select")?.value;
+          const contactIds = Array.from(document.querySelectorAll(".draft-prep-checkbox:checked")).map((box) => box.value);
+          if (!templateId || contactIds.length === 0) {
+            if (draftGenerateProgress) draftGenerateProgress.textContent = "请选择模板和至少一个准备区客户。";
+            return;
+          }
+          const totals = { processed: 0, created: 0, updated: 0, auto_approved: 0, exceptions: 0, skipped: 0 };
+          const batchSize = 50;
+          if (draftGenerateButton) draftGenerateButton.disabled = true;
+          try {
+            for (let offset = 0; offset < contactIds.length; offset += batchSize) {
+              const batch = contactIds.slice(offset, offset + batchSize);
+              if (draftGenerateProgress) draftGenerateProgress.textContent = `正在生成草稿：${Math.min(offset + batch.length, contactIds.length)} / ${contactIds.length}`;
+              const formData = new FormData();
+              formData.append("template_id", templateId);
+              batch.forEach((contactId) => formData.append("contact_ids", contactId));
+              const response = await fetch("/drafts/generate-batch", { method: "POST", body: formData });
+              if (!response.ok) throw new Error(`Batch request failed: ${response.status}`);
+              const result = await response.json();
+              if (!result.ok) throw new Error(result.message || "Batch generation failed.");
+              Object.entries(result.stats || {}).forEach(([key, value]) => {
+                totals[key] = (totals[key] || 0) + Number(value || 0);
+              });
+            }
+          } catch (error) {
+            if (draftGenerateProgress) draftGenerateProgress.textContent = `草稿生成中断：${error.message}`;
+            if (draftGenerateButton) draftGenerateButton.disabled = false;
+            return;
+          }
+          const doneMessage = `Generated/updated ${totals.created + totals.updated} draft(s). Auto-approved ${totals.auto_approved}, exceptions ${totals.exceptions}, skipped ${totals.skipped}.`;
+          window.location.href = `/?message=${encodeURIComponent(doneMessage)}`;
+        });
+      }
+
+      const draftPrepDialog = document.getElementById("draft-prep-edit-dialog");
+      const draftPrepForm = document.getElementById("draft-prep-edit-form");
+      document.querySelectorAll(".draft-prep-edit-toggle").forEach((button) => {
+        button.addEventListener("click", function () {
+          if (!draftPrepDialog || !draftPrepForm) return;
+          draftPrepForm.action = `/draft-prep/${button.dataset.contactId}/update`;
+          document.getElementById("edit-company").value = button.dataset.company || "";
+          document.getElementById("edit-full-name").value = button.dataset.fullName || "";
+          document.getElementById("edit-position").value = button.dataset.position || "";
+          document.getElementById("edit-email").value = button.dataset.email || "";
+          document.getElementById("edit-country").value = button.dataset.country || "";
+          document.getElementById("edit-region").value = button.dataset.region || "";
+          document.getElementById("edit-priority").value = button.dataset.priority || "B";
+          draftPrepDialog.showModal();
+        });
+      });
+      document.querySelectorAll("[data-dialog-close]").forEach((button) => {
+        button.addEventListener("click", function () {
+          if (draftPrepDialog) draftPrepDialog.close();
+        });
+      });
+
+      const templateSelect = document.getElementById("template-select");
+      const previewSubject = document.getElementById("template-preview-subject");
+      const previewCc = document.getElementById("template-preview-cc");
+      const previewBody = document.getElementById("template-preview-body");
+      function refreshTemplatePreview() {
+        if (!templateSelect || !templateSelect.selectedOptions.length) return;
+        const option = templateSelect.selectedOptions[0];
+        previewSubject.textContent = option.dataset.subject || "-";
+        previewCc.textContent = option.dataset.ccEnabled === "yes" ? (option.dataset.cc || "-") : "未启用";
+        previewBody.innerHTML = option.dataset.body || "该模板暂无正文。";
+      }
+      if (templateSelect) {
+        templateSelect.addEventListener("change", refreshTemplatePreview);
+        refreshTemplatePreview();
+      }
+
+      const signatureContact = document.getElementById("signature-preview-contact");
+      const signatureSender = document.getElementById("signature-preview-sender");
+      const signatureBody = document.getElementById("signature-preview-body");
+      const signatureRegion = document.getElementById("signature-preview-region");
+      const signatureEmail = document.getElementById("signature-preview-email");
+      const signaturePhone = document.getElementById("signature-preview-phone");
+      const signatureCountry = document.getElementById("signature-preview-country");
+      const signatureFromChecked = document.getElementById("signature-preview-from-checked");
+
+      function setSignaturePreviewMessage(message) {
+        if (signatureBody) signatureBody.textContent = message;
+        if (signatureRegion) signatureRegion.textContent = "-";
+        if (signatureEmail) signatureEmail.textContent = "-";
+        if (signaturePhone) signaturePhone.textContent = "-";
+        if (signatureCountry) signatureCountry.textContent = "-";
+      }
+
+      async function refreshSignaturePreview() {
+        if (!signatureContact || !signatureBody) return;
+        const contactId = signatureContact.value;
+        const senderId = signatureSender ? signatureSender.value : "";
+        if (!contactId) {
+          setSignaturePreviewMessage("请选择准备区客户查看签名。");
+          return;
+        }
+        const params = new URLSearchParams({ contact_id: contactId });
+        if (senderId) params.set("sender_id", senderId);
+        try {
+          const response = await fetch(`/signature/preview?${params.toString()}`);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const result = await response.json();
+          if (!result.enabled) {
+            setSignaturePreviewMessage("当前签名模块未启用。");
+            return;
+          }
+          signatureBody.innerHTML = result.html || "签名为空。";
+          if (signatureRegion) signatureRegion.textContent = result.context?.region || "-";
+          if (signatureEmail) signatureEmail.textContent = result.context?.sender_email || "-";
+          if (signaturePhone) signaturePhone.textContent = result.context?.phone || "-";
+          if (signatureCountry) signatureCountry.textContent = result.country || "-";
+        } catch (error) {
+          setSignaturePreviewMessage(`签名预览加载失败：${error.message}`);
+        }
+      }
+
+      function refreshSignaturePreviewFromChecked() {
+        if (!signatureContact) return;
+        const checked = document.querySelector(".draft-prep-checkbox:checked");
+        if (checked) {
+          signatureContact.value = checked.value;
+        }
+        refreshSignaturePreview();
+      }
+
+      if (signatureContact) signatureContact.addEventListener("change", refreshSignaturePreview);
+      if (signatureSender) signatureSender.addEventListener("change", refreshSignaturePreview);
+      if (signatureFromChecked) signatureFromChecked.addEventListener("click", refreshSignaturePreviewFromChecked);
+      document.querySelectorAll(".draft-prep-checkbox").forEach((box) => {
+        box.addEventListener("change", () => {
+          if (box.checked && signatureContact && !signatureContact.value) {
+            signatureContact.value = box.value;
+          }
+          refreshSignaturePreview();
+        });
+      });
+      refreshSignaturePreview();
+
+      const timeCheck = document.getElementById("time-check");
+      if (timeCheck) {
+        const serverNow = new Date(timeCheck.dataset.serverNow);
+        const localNow = new Date();
+        const diffMinutes = Math.abs(serverNow.getTime() - localNow.getTime()) / 60000;
+        if (diffMinutes > 10) {
+          timeCheck.textContent = "电脑时间可能不准";
+          timeCheck.className = "time-warn";
+        } else {
+          timeCheck.textContent = "电脑时间正常";
+          timeCheck.className = "time-ok";
+        }
+      }
+      const clock = document.getElementById("computer-clock");
+      function tickClock() {
+        if (!clock) return;
+        clock.textContent = `电脑时间：${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+      }
+      tickClock();
+      setInterval(tickClock, 1000);
+    </script>
+  </body>
+</html>

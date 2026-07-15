@@ -1,0 +1,47 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>黑名单 / 退订</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>黑名单 / 退订名单</h1>
+            <p>队列发送前会检查 suppression，命中则跳过。</p>
+          </div>
+          <a class="button secondary" href="/">返回发送工作台</a>
+        </header>
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+        <section class="panel">
+          <form action="/suppressions" method="post" class="form-grid">
+            <label>邮箱<input name="email" type="email" required /></label>
+            <label>原因
+              <select name="reason">
+                <option value="blacklist">blacklist</option>
+                <option value="unsubscribe">unsubscribe</option>
+                <option value="invalid">invalid</option>
+              </select>
+            </label>
+            <button type="submit">加入名单</button>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>邮箱</th><th>原因</th><th>加入时间</th></tr></thead>
+              <tbody>
+                {% for item in suppressions %}
+                  <tr><td>{{ item.email }}</td><td>{{ item.reason }}</td><td>{{ display_dt(item.created_at) }}</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

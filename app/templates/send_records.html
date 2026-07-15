@@ -1,0 +1,77 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>发送总记录</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>发送总记录</h1>
+            <p>这里集中显示所有真实 SMTP 成功后的发送记录，共 {{ send_record_count }} 条。演练模式不会写入这里。</p>
+            <div class="version-line">
+              <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
+              <span>版本 {{ app_version }}</span>
+            </div>
+          </div>
+          <div class="topbar-actions">
+            <form action="/bounces/scan" method="post">
+              <button class="secondary" type="submit">扫描退信并剔除</button>
+            </form>
+            <a class="button secondary" href="/bounces/log">退信日志</a>
+            <a class="button secondary" href="/">返回发送工作台</a>
+          </div>
+        </header>
+
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>全部真实发送记录</h2>
+              <p>按发送时间倒序显示，最多展示最近 1000 条。</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>发送时间</th><th>状态</th><th>公司</th><th>联系人</th><th>收件邮箱</th><th>发件邮箱</th><th>Subject</th><th>内容</th></tr>
+              </thead>
+              <tbody>
+                {% for record in send_records %}
+                  {% set company = company_by_id.get(record.company_id) %}
+                  {% set contact = contact_by_id.get(record.contact_id) %}
+                  <tr>
+                    <td>{{ display_dt(record.sent_at) }}</td>
+                    <td><span class="badge {{ 'danger' if record.smtp_status == 'bounced' else '' }}">{{ record.smtp_status }}</span></td>
+                    <td>{{ company.name if company else "-" }}</td>
+                    <td>{{ contact.full_name if contact else "-" }}</td>
+                    <td>{{ record.recipient_email }}</td>
+                    <td>{{ record.sender_email }}</td>
+                    <td>{{ record.subject }}</td>
+                    <td>
+                      <details class="preview">
+                        <summary>查看邮件</summary>
+                        {% if record.cc_emails %}<p><strong>CC：</strong>{{ record.cc_emails }}</p>{% endif %}
+                        {% if record.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(record.attachment_paths) }}</p>{% endif %}
+                        <div class="preview-body">{{ record.body_html | safe }}</div>
+                      </details>
+                    </td>
+                  </tr>
+                {% endfor %}
+                {% if not send_records %}
+                  <tr><td colspan="8">暂无真实发送记录。</td></tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,129 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>发件邮箱</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>发件邮箱</h1>
+            <p>这里管理用于 SMTP 发送的邮箱、每日上限、发送时间窗口、发送间隔和打开追踪。保存窗口后，该邮箱现有待发送队列会重新排程；窗口按本机时间执行，支持 17:00-02:00 这类跨午夜窗口。</p>
+            <div class="version-line">
+              <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
+              <span>版本 {{ app_version }}</span>
+            </div>
+          </div>
+          <a class="button secondary" href="/">返回发送工作台</a>
+        </header>
+
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>已录入发件邮箱</h2>
+              <p>修改后会立即影响后续进入队列的邮件，已发送记录不会改变。</p>
+            </div>
+          </div>
+          <div class="notice">建议量：新邮箱或陌生开发信先按 20-30 封/邮箱/天；常规 BD 邮箱默认建议 30 封/天，超过 40 封/天需要谨慎。</div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>发件邮箱</th><th>今日额度</th><th>建议量</th><th>当前设置</th><th>编辑设置</th></tr></thead>
+              <tbody>
+                {% for item in sender_usage %}
+                  {% set is_no_delay = item.sender.random_delay_min_seconds == 0 and item.sender.random_delay_max_seconds == 0 %}
+                  {% set is_fixed_delay = item.sender.random_delay_min_seconds == item.sender.random_delay_max_seconds and not is_no_delay %}
+                  <tr>
+                    <td>{{ item.sender.email }}<br><small>{{ item.sender.name }} / {{ "启用" if item.sender.is_active else "停用" }}</small></td>
+                    <td>{{ item.sent_today }}/{{ item.sender.daily_limit }}，剩余 {{ item.remaining }}</td>
+                    <td><strong>{{ item.advice.recommended_daily_limit }}/天</strong><br><small>{{ item.advice.provider }}；警戒线 {{ item.advice.caution_daily_limit }}/天</small></td>
+                    <td>
+                      <small>SMTP：{{ item.sender.smtp_host }}:{{ item.sender.smtp_port }}</small><br>
+                      <small>窗口：{{ item.sender.window_start.strftime('%H:%M') }} - {{ item.sender.window_end.strftime('%H:%M') }}{% if item.sender.window_start > item.sender.window_end %}（跨午夜）{% endif %}</small><br>
+                      {% if is_no_delay %}<small>发送间隔：不加额外延迟</small>{% elif is_fixed_delay %}<small>发送间隔：固定 {{ item.sender.random_delay_min_seconds }} 秒</small>{% else %}<small>发送间隔：随机 {{ item.sender.random_delay_min_seconds }}-{{ item.sender.random_delay_max_seconds }} 秒</small>{% endif %}
+                      <form action="/senders/{{ item.sender.id }}/window" method="post" class="inline-window-form">
+                        <input name="window_start" type="time" value="{{ item.sender.window_start.strftime('%H:%M') }}" aria-label="窗口开始" />
+                        <input name="window_end" type="time" value="{{ item.sender.window_end.strftime('%H:%M') }}" aria-label="窗口结束" />
+                        <button class="secondary" type="submit">保存窗口</button>
+                      </form>
+                    </td>
+                    <td>
+                      <details class="sender-editor">
+                        <summary>编辑发件邮箱设置</summary>
+                        <form action="/senders/{{ item.sender.id }}/settings" method="post" class="form-grid sender-edit-grid">
+                          <label>显示名<input name="name" value="{{ item.sender.name }}" required /></label>
+                          <label>邮箱<input name="email" type="email" value="{{ item.sender.email }}" required /></label>
+                          <label>SMTP Host<input name="smtp_host" value="{{ item.sender.smtp_host }}" required /></label>
+                          <label>SMTP Port<input name="smtp_port" type="number" value="{{ item.sender.smtp_port }}" /></label>
+                          <label>SMTP Username<input name="smtp_username" value="{{ item.sender.smtp_username or '' }}" /></label>
+                          <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="{{ '已加密保存，留空则不修改' if item.sender.smtp_password_encrypted else '输入后加密保存' }}" /></label>
+                          <label>密码环境变量（备用）<input name="password_env" value="{{ item.sender.password_env or '' }}" placeholder="SMTP_PASSWORD_PRIMARY" /></label>
+                          <label>单日最大发送数<input name="daily_limit" type="number" min="1" max="10000" value="{{ item.sender.daily_limit }}" /></label>
+                          <label>发送窗口开始<input name="window_start" type="time" value="{{ item.sender.window_start.strftime('%H:%M') }}" /></label>
+                          <label>发送窗口结束<input name="window_end" type="time" value="{{ item.sender.window_end.strftime('%H:%M') }}" /></label>
+                          <label>发送间隔策略
+                            <select name="interval_mode">
+                              <option value="random" {% if not is_no_delay and not is_fixed_delay %}selected{% endif %}>随机间隔</option>
+                              <option value="fixed" {% if is_fixed_delay %}selected{% endif %}>固定间隔</option>
+                              <option value="none" {% if is_no_delay %}selected{% endif %}>不加额外延迟</option>
+                            </select>
+                          </label>
+                          <label>最小随机延迟秒<input name="random_delay_min_seconds" type="number" value="{{ item.sender.random_delay_min_seconds }}" /></label>
+                          <label>最大随机延迟秒<input name="random_delay_max_seconds" type="number" value="{{ item.sender.random_delay_max_seconds }}" /></label>
+                          <label>固定延迟秒<input name="fixed_delay_seconds" type="number" value="{{ item.sender.random_delay_min_seconds if is_fixed_delay else 300 }}" /></label>
+                          <label class="checkbox-line"><input name="enable_open_tracking" type="checkbox" value="true" {% if item.sender.enable_open_tracking %}checked{% endif %} /> 开启打开追踪</label>
+                          <label class="checkbox-line"><input name="is_active" type="checkbox" value="true" {% if item.sender.is_active %}checked{% endif %} /> 启用该发件邮箱</label>
+                          <button type="submit">保存发件邮箱设置</button>
+                        </form>
+                      </details>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>新增发件邮箱</h2>
+              <p>SMTP 密码会在本机后端加密保存，页面不会回显明文。环境变量仅作为备用方式。</p>
+            </div>
+          </div>
+          <form action="/senders" method="post" class="form-grid">
+            <label>显示名<input name="name" value="{{ settings.default_sender_name }}" required /></label>
+            <label>邮箱<input name="email" type="email" required /></label>
+            <label>SMTP Host<input name="smtp_host" required /></label>
+            <label>SMTP Port<input name="smtp_port" type="number" value="465" /></label>
+            <label>SMTP Username<input name="smtp_username" /></label>
+            <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="输入后加密保存" /></label>
+            <label>密码环境变量（备用）<input name="password_env" placeholder="SMTP_PASSWORD_PRIMARY" /></label>
+            <label>单日最大发送数<input name="daily_limit" type="number" value="{{ default_recommended_daily_limit }}" min="1" max="10000" /></label>
+            <label>发送窗口开始<input name="window_start" type="time" value="09:30" /></label>
+            <label>发送窗口结束<input name="window_end" type="time" value="17:30" /></label>
+            <label>发送间隔策略
+              <select name="interval_mode">
+                <option value="random" selected>随机间隔</option>
+                <option value="fixed">固定间隔</option>
+                <option value="none">不加额外延迟</option>
+              </select>
+            </label>
+            <label>最小随机延迟秒<input name="random_delay_min_seconds" type="number" value="180" /></label>
+            <label>最大随机延迟秒<input name="random_delay_max_seconds" type="number" value="600" /></label>
+            <label>固定延迟秒<input name="fixed_delay_seconds" type="number" value="300" /></label>
+            <label class="checkbox-line"><input name="enable_open_tracking" type="checkbox" value="true" /> 开启打开追踪</label>
+            <button type="submit">保存邮箱</button>
+          </form>
+        </section>
+
+      </section>
+    </main>
+  </body>
+</html>

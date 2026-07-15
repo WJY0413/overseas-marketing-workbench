@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>客户库 CRM</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}-crm-table" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>客户库 CRM</h1>
+            <p>按公司聚合客户资料，展开公司查看全量联系人，展开联系人查看全部联系方式。</p>
+          </div>
+          <a class="button secondary" href="/">返回发送工作台</a>
+        </header>
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>公司视图</h2>
+            <small>{{ company_rows|length }} 家公司 · {{ contacts|length }} 个联系人</small>
+          </div>
+          <div class="crm-company-list">
+            <div class="crm-table-head crm-company-head">
+              <span>公司</span>
+              <span>评级</span>
+              <span>国家</span>
+              <span>区域</span>
+              <span>类型</span>
+              <span>来源</span>
+              <span>联系人</span>
+              <span>routes</span>
+              <span>email</span>
+              <span>phone</span>
+              <span>LinkedIn</span>
+            </div>
+            {% for row in company_rows %}
+              {% set company = row.company %}
+              <details class="crm-company">
+                <summary class="crm-company-summary">
+                  <span class="crm-toggle"></span>
+                  <span class="crm-company-row">
+                    <span class="crm-company-name"><strong>{{ company.name }}</strong></span>
+                    <span><span class="badge">{{ company.priority }}</span></span>
+                    <span>{{ company.country or "-" }}</span>
+                    <span>{{ company.region or "-" }}</span>
+                    <span>{{ company.company_type or "-" }}</span>
+                    <span>{{ company.source or "-" }}</span>
+                    <span>{{ row.contact_count }}</span>
+                    <span>{{ row.route_count }}</span>
+                    <span>{{ row.route_counts.get("email", 0) }}</span>
+                    <span>{{ row.route_counts.get("phone", 0) }}</span>
+                    <span>{{ row.route_counts.get("linkedin", 0) }}</span>
+                  </span>
+                </summary>
+
+                <div class="crm-company-body">
+                  <div class="crm-company-grid">
+                    <div>
+                      <small>来源</small>
+                      <p>{{ company.source or "-" }}</p>
+                    </div>
+                    <div>
+                      <small>跟进状态</small>
+                      <p>{{ "未跟进" if not company.last_contact_at else "已跟进" }}</p>
+                    </div>
+                    <div>
+                      <small>最近跟进</small>
+                      <p>{{ display_dt(company.last_contact_at) }}</p>
+                    </div>
+                    <div>
+                      <small>区域</small>
+                      <p>{{ company.region or "-" }}</p>
+                    </div>
+                    <div>
+                      <small>下次跟进</small>
+                      <p>{{ display_dt(company.next_follow_up_at) }}</p>
+                    </div>
+                  </div>
+
+                  {% if company.notes %}
+                    <details class="crm-notes">
+                      <summary>公司介绍 / 备注 / 原表上下文</summary>
+                      <pre>{{ company.notes }}</pre>
+                    </details>
+                  {% endif %}
+
+                  <div class="crm-contact-list">
+                    <div class="crm-table-head crm-contact-head">
+                      <span></span>
+                      <span>联系人</span>
+                      <span>主联系方式</span>
+                      <span>状态</span>
+                    </div>
+                    {% for contact_row in row.contacts %}
+                      {% set contact = contact_row.contact %}
+                      <details class="crm-contact">
+                        <summary class="crm-contact-summary">
+                          <span class="crm-contact-main">
+                            <strong>{{ contact.full_name }}</strong>
+                            <small>{{ contact.position or "-" }}</small>
+                          </span>
+                          <span class="crm-primary-route">
+                            {% if contact_row.primary_route %}
+                              <b>{{ contact_row.primary_route.route_type }}</b>
+                              {{ contact_row.primary_route.route_value }}
+                            {% else %}
+                              -
+                            {% endif %}
+                          </span>
+                          <span class="crm-contact-meta">
+                            {{ "主联系人" if contact.is_primary else "联系人" }} · {{ contact.status }} · routes {{ contact_row.route_count }}
+                          </span>
+                        </summary>
+                        <div class="crm-route-list">
+                          {% if contact_row.routes %}
+                            <div class="crm-table-head crm-route-head">
+                              <span>类型</span>
+                              <span>联系方式</span>
+                              <span>主路线</span>
+                              <span>来源</span>
+                              <span>原始值</span>
+                            </div>
+                            {% for route in contact_row.routes %}
+                              <div class="crm-route">
+                                <span class="badge">{{ route.route_type }}</span>
+                                <span class="crm-route-value">{{ route.route_value }}</span>
+                                <small>{{ "primary" if route.is_primary else "-" }}</small>
+                                <small>{{ route.source or "-" }}</small>
+                                {% if route.raw_cell %}
+                                  <details class="crm-raw-cell">
+                                    <summary>raw</summary>
+                                    <pre>{{ route.raw_cell }}</pre>
+                                  </details>
+                                {% else %}
+                                  <small>-</small>
+                                {% endif %}
+                              </div>
+                            {% endfor %}
+                          {% elif contact.email %}
+                            <div class="crm-table-head crm-route-head">
+                              <span>类型</span>
+                              <span>联系方式</span>
+                              <span>主路线</span>
+                              <span>来源</span>
+                              <span>原始值</span>
+                            </div>
+                            <div class="crm-route">
+                              <span class="badge">email</span>
+                              <span class="crm-route-value">{{ contact.email }}</span>
+                              <small>primary</small>
+                              <small>contact fallback</small>
+                              <small>-</small>
+                            </div>
+                          {% else %}
+                            <p>无联系方式</p>
+                          {% endif %}
+                        </div>
+                      </details>
+                    {% else %}
+                      <p>暂无联系人。</p>
+                    {% endfor %}
+                  </div>
+                </div>
+              </details>
+            {% else %}
+              <p>客户库暂无公司。</p>
+            {% endfor %}
+          </div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>

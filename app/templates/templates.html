@@ -1,0 +1,263 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>邮件模板</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>邮件模板</h1>
+            <p>新建、导入和维护邮件模板。正文编辑框支持直接从 Word 复制粘贴。</p>
+            <div class="version-line">
+              <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
+              <span>版本 {{ app_version }}</span>
+            </div>
+          </div>
+          <a class="button secondary" href="/">返回工作台</a>
+        </header>
+
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>导入模板</h2>
+              <p>Word 模板适合日常维护；同名导入会更新旧模板，避免新旧并存。</p>
+            </div>
+          </div>
+          <div class="split-grid">
+            <form action="/templates/import-docx" method="post" enctype="multipart/form-data" class="form-grid wide docx-import-form">
+              <label>模板名称<input name="name" placeholder="默认使用 Word 文件名" /></label>
+              <label>模板类型<input name="template_type" value="first_touch" /></label>
+              <label>Subject<input name="subject" placeholder="Exploring smart turf management" /></label>
+              <label>Word 文件<input type="file" name="file" accept=".docx" required /></label>
+              <button type="submit">导入 Word 模板</button>
+            </form>
+            <form action="/templates/import" method="post" enctype="multipart/form-data" class="form-grid wide">
+              <label>模板名称<input name="name" placeholder="HTML or text template" required /></label>
+              <label>模板类型<input name="template_type" value="first_touch" /></label>
+              <label>Subject<input name="subject" required /></label>
+              <label>HTML/TXT 文件<input type="file" name="file" accept=".html,.htm,.txt,.md,.markdown" required /></label>
+              <button class="secondary" type="submit">导入 HTML/TXT</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel" id="signature-template">
+          <div class="panel-head">
+            <div>
+              <h2>签名模板</h2>
+              <p>签名正文、图片和加粗样式使用邮件模板同一套 HTML 存储；保存后生成草稿、入队刷新和发送前刷新都会使用最新签名。</p>
+            </div>
+          </div>
+          {% set signature_body_html = signature_template.body_html if signature_template else "" %}
+          {% set signature_body_text = signature_template.body_text if signature_template and signature_template.body_text else "" %}
+          <div class="split-grid">
+            <form action="/templates/signature/import-docx" method="post" enctype="multipart/form-data" class="form-grid wide docx-import-form">
+              <label>签名名称<input name="name" value="{{ signature_template.name if signature_template else default_signature_template_name }}" /></label>
+              <label>Word 签名文件<input type="file" name="file" accept=".docx" required /></label>
+              <button type="submit">导入 Word 签名</button>
+            </form>
+            <form action="/templates/signature" method="post" class="form-grid wide rich-template-form">
+              <label>签名名称<input name="name" value="{{ signature_template.name if signature_template else default_signature_template_name }}" required /></label>
+              <details class="advanced-fields">
+                <summary>纯文本签名</summary>
+                <label>纯文本正文<textarea name="body_text">{{ signature_body_text }}</textarea></label>
+              </details>
+              <label class="rich-editor-field">签名正文
+                <input type="hidden" name="body_html" class="rich-html-input" value="{{ signature_body_html | e }}" required />
+                <span class="rich-toolbar">
+                  <button type="button" class="secondary insert-image-button">插入图片</button>
+                  <input type="file" class="rich-image-input" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
+                  <small>这里和邮件模板使用同一套富文本保存逻辑。</small>
+                </span>
+                <div class="rich-editor" contenteditable="true" data-placeholder="Kind regards,">{{ signature_body_html | safe }}</div>
+              </label>
+              <button type="submit">保存签名</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>新建模板</h2>
+              <p>常用变量：{{ "{{ company }}" }}、{{ "{{ first_name }}" }}、{{ "{{ full_name }}" }}、{{ "{{ country }}" }}、{{ "{{ region }}" }}。</p>
+            </div>
+          </div>
+          <form action="/templates" method="post" class="form-grid wide rich-template-form">
+            <label>模板名称<input name="name" placeholder="First touch - Distributor" required /></label>
+            <label>Subject<input name="subject" placeholder="Robotic groundcare solutions for {{ "{{ company }}" }}" required /></label>
+            <label>模板类型<input name="template_type" value="first_touch" /></label>
+            <details class="advanced-fields">
+              <summary>抄送与高级字段</summary>
+              <label>CC 邮箱<input name="cc_emails" placeholder="cc1@example.com, cc2@example.com" /></label>
+              <label class="checkbox-line"><input name="cc_enabled" type="checkbox" value="true" /> 启用 CC</label>
+              <label>纯文本正文<textarea name="body_text" placeholder="可选；留空时自动从正文生成"></textarea></label>
+            </details>
+            <label class="rich-editor-field">正文
+              <input type="hidden" name="body_html" class="rich-html-input" required />
+              <span class="rich-toolbar">
+                <button type="button" class="secondary insert-image-button">插入图片</button>
+                <input type="file" class="rich-image-input" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
+                <small>建议单张图片小于 1.5 MB；发送时会自动转为邮件内嵌图片。</small>
+              </span>
+              <div class="rich-editor" contenteditable="true" data-placeholder="Dear {{ "{{ first_name }}" }},"></div>
+            </label>
+            <button type="submit">保存模板</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>已有模板</h2>
+              <p>编辑时只展开当前模板，减少页面干扰。停用模板不会出现在工作台下拉框。</p>
+            </div>
+          </div>
+          <div class="template-edit-list">
+            {% for template in templates %}
+              <details class="template-editor">
+                <summary>{{ template.name }}{% if not template.is_active %} / 已停用{% endif %}</summary>
+                <form action="/templates/{{ template.id }}/settings" method="post" class="form-grid wide rich-template-form">
+                  <label>模板名称<input name="name" value="{{ template.name }}" required /></label>
+                  <label>Subject<input name="subject" value="{{ template.subject }}" required /></label>
+                  <label>模板类型<input name="template_type" value="{{ template.template_type }}" /></label>
+                  <details class="advanced-fields">
+                    <summary>抄送与高级字段</summary>
+                    <label>CC 邮箱<input name="cc_emails" value="{{ template.cc_emails or '' }}" placeholder="cc1@example.com, cc2@example.com" /></label>
+                    <label class="checkbox-line"><input name="cc_enabled" type="checkbox" value="true" {% if template.cc_enabled %}checked{% endif %} /> 启用 CC</label>
+                    <label class="checkbox-line"><input name="is_active" type="checkbox" value="true" {% if template.is_active %}checked{% endif %} /> 启用模板</label>
+                    <label>纯文本正文<textarea name="body_text">{{ template.body_text or '' }}</textarea></label>
+                  </details>
+                  <label class="rich-editor-field">正文
+                    <input type="hidden" name="body_html" class="rich-html-input" value="{{ template.body_html | e }}" required />
+                    <span class="rich-toolbar">
+                      <button type="button" class="secondary insert-image-button">插入图片</button>
+                      <input type="file" class="rich-image-input" accept="image/png,image/jpeg,image/gif,image/webp" hidden />
+                      <small>建议单张图片小于 1.5 MB；发送时会自动转为邮件内嵌图片。</small>
+                    </span>
+                    <div class="rich-editor" contenteditable="true" data-placeholder="Dear {{ "{{ first_name }}" }},">{{ template.body_html | safe }}</div>
+                  </label>
+                  <button type="submit">保存修改</button>
+                </form>
+                <form action="/templates/{{ template.id }}/delete" method="post" class="template-delete-form" data-template-name="{{ template.name | e }}">
+                  <button type="submit" class="danger">删除模板</button>
+                </form>
+              </details>
+            {% endfor %}
+            {% if not templates %}
+              <div class="notice">还没有模板。先导入 Word 模板或新建一个模板。</div>
+            {% endif %}
+          </div>
+        </section>
+      </section>
+    </main>
+    <script>
+      document.querySelectorAll(".rich-template-form").forEach((form) => {
+        const editor = form.querySelector(".rich-editor");
+        const htmlInput = form.querySelector(".rich-html-input");
+        const imageButton = form.querySelector(".insert-image-button");
+        const imageInput = form.querySelector(".rich-image-input");
+        const maxImageBytes = 1.5 * 1024 * 1024;
+        function syncRichEditor() {
+          if (!editor || !htmlInput) return;
+          htmlInput.value = editor.innerHTML.trim();
+        }
+        function insertImageDataUrl(dataUrl, fileName) {
+          if (!editor) return;
+          const img = document.createElement("img");
+          img.src = dataUrl;
+          img.alt = fileName || "";
+          img.style.maxWidth = "100%";
+          img.style.height = "auto";
+          img.style.display = "block";
+          img.style.margin = "12px 0";
+          editor.focus();
+          const selection = window.getSelection();
+          if (selection && selection.rangeCount > 0 && editor.contains(selection.anchorNode)) {
+            const range = selection.getRangeAt(0);
+            range.deleteContents();
+            range.insertNode(img);
+            range.setStartAfter(img);
+            range.collapse(true);
+            selection.removeAllRanges();
+            selection.addRange(range);
+          } else {
+            editor.appendChild(img);
+          }
+          syncRichEditor();
+        }
+        function insertImageFile(file) {
+          if (!file || !file.type.startsWith("image/")) return;
+          if (file.size > maxImageBytes) {
+            alert("图片过大。建议压缩到 1.5 MB 以内再插入，避免邮件被拦截或加载过慢。");
+            return;
+          }
+          const reader = new FileReader();
+          reader.addEventListener("load", function () {
+            insertImageDataUrl(reader.result, file.name);
+          });
+          reader.readAsDataURL(file);
+        }
+        if (editor && htmlInput) {
+          editor.addEventListener("input", syncRichEditor);
+          editor.addEventListener("paste", function (event) {
+            const imageFile = Array.from(event.clipboardData?.files || []).find((file) => file.type.startsWith("image/"));
+            if (imageFile) {
+              event.preventDefault();
+              insertImageFile(imageFile);
+              return;
+            }
+            setTimeout(syncRichEditor, 0);
+          });
+          syncRichEditor();
+        }
+        if (imageButton && imageInput) {
+          imageButton.addEventListener("click", function () {
+            imageInput.click();
+          });
+          imageInput.addEventListener("change", function () {
+            Array.from(imageInput.files || []).forEach(insertImageFile);
+            imageInput.value = "";
+          });
+        }
+        form.addEventListener("submit", function (event) {
+          syncRichEditor();
+          if (htmlInput && !htmlInput.value.trim()) {
+            event.preventDefault();
+            alert("请填写模板正文。可以直接从 Word 复制粘贴到正文框。");
+          }
+        });
+      });
+      document.querySelectorAll(".docx-import-form").forEach((form) => {
+        const nameInput = form.querySelector('input[name="name"]');
+        const fileInput = form.querySelector('input[name="file"]');
+        if (!nameInput || !fileInput) return;
+        nameInput.addEventListener("input", function () {
+          nameInput.dataset.userEdited = "true";
+        });
+        fileInput.addEventListener("change", function () {
+          const file = fileInput.files && fileInput.files[0];
+          if (!file || nameInput.dataset.userEdited === "true") return;
+          nameInput.value = file.name.replace(/\.[^.]+$/, "");
+        });
+      });
+      document.querySelectorAll(".template-delete-form").forEach((form) => {
+        form.addEventListener("submit", function (event) {
+          const templateName = form.dataset.templateName || "this template";
+          const confirmed = window.confirm(`确认删除模板「${templateName}」？已有草稿或跟进规则引用时系统会改为停用，避免破坏历史记录。`);
+          if (!confirmed) {
+            event.preventDefault();
+          }
+        });
+      });
+    </script>
+  </body>
+</html>
