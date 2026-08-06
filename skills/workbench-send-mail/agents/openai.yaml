@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench 邮件发送"
+  short_description: "预览、放行并核验本地 Workbench 邮件发送结果"
+  default_prompt: "Use $workbench-send-mail to prepare a Workbench email send preview."

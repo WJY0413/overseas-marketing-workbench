@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 from dataclasses import dataclass
 from io import BytesIO
@@ -9,6 +9,7 @@ from sqlmodel import Session, select
 
 from app.models import Company, Contact, ContactRoute
 from app.services.email_quality import validate_contact_email
+from app.services.no_go_companies import company_match_key, is_no_go_company
 from app.time_utils import utc_now
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
@@ -435,8 +436,7 @@ def _skip(report: dict[str, int | list[int] | str | dict[str, int]], reason: str
 
 
 def _is_blacklisted_company(company: Company | None, row_data: dict[str, str]) -> bool:
-    status = (company.status or "").strip().lower() if company is not None else ""
-    if status in {"blacklist", "blacklisted", "blocked", "suppressed"}:
+    if company is not None and is_no_go_company(company):
         return True
     return str(row_data.get("blacklist") or row_data.get("is_blacklisted") or "").strip().lower() in {"1", "true", "yes", "blacklisted"}
 
@@ -451,6 +451,11 @@ def _import_normalized_rows(
 ) -> dict[str, int | list[int] | str | dict[str, int]]:
     report = _new_report(source_label, valid_sheets=valid_sheets, skipped_sheets=skipped_sheets)
     contact_ids: list[int] = report["contact_ids"]  # type: ignore[assignment]
+    no_go_companies = {
+        company_match_key(company.name): company
+        for company in session.exec(select(Company)).all()
+        if is_no_go_company(company)
+    }
 
     for row_data in rows:
         skip_reason = row_data.get("_skip_reason", "")
@@ -467,7 +472,7 @@ def _import_normalized_rows(
             continue
 
         existing_company = session.exec(select(Company).where(Company.name == company_name)).first()
-        if _is_blacklisted_company(existing_company, row_data):
+        if company_match_key(company_name) in no_go_companies or _is_blacklisted_company(existing_company, row_data):
             _skip(report, "blacklisted_company")
             continue
 
@@ -570,7 +575,6 @@ def _import_normalized_rows(
 
     session.commit()
     return report
-
 
 def _row_values(
     ws,

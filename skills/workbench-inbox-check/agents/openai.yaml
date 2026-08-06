@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench Inbox Check"
+  short_description: "Check Workbench sender inboxes for replies or bounces"
+  default_prompt: "Use $workbench-inbox-check to inspect sender inbox replies or bounce clues for a Workbench send."

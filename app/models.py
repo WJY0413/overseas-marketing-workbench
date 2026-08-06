@@ -10,7 +10,7 @@ from app.time_utils import utc_now
 
 class Company(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    name: str = Field(index=True, unique=True)
+    name: str = Field(index=True)
     country: str | None = Field(default=None, index=True)
     region: str | None = Field(default=None, index=True)
     company_type: str | None = None
@@ -89,6 +89,10 @@ class SenderAccount(SQLModel, table=True):
     daily_limit: int = 30
     window_start: time = time(9, 30)
     window_end: time = time(17, 30)
+    # Legacy single-window fields remain for backwards compatibility. New scheduling
+    # uses the sender's IANA timezone and the JSON list of daytime windows.
+    send_timezone: str | None = None
+    send_windows_json: str | None = Field(default=None, sa_column=Column(Text))
     random_delay_min_seconds: int = 180
     random_delay_max_seconds: int = 600
     enable_open_tracking: bool = False
@@ -102,6 +106,7 @@ class EmailDraft(SQLModel, table=True):
     company_id: int = Field(foreign_key="company.id", index=True)
     contact_id: int = Field(foreign_key="contact.id", index=True)
     template_id: int | None = Field(default=None, foreign_key="emailtemplate.id")
+    signature_template_id: int | None = Field(default=None, foreign_key="emailtemplate.id", index=True)
     sender_account_id: int | None = Field(default=None, foreign_key="senderaccount.id")
     subject: str
     body_html: str = Field(sa_column=Column(Text))
@@ -126,6 +131,8 @@ class SendRecord(SQLModel, table=True):
     company_id: int = Field(foreign_key="company.id", index=True)
     contact_id: int = Field(foreign_key="contact.id", index=True)
     sender_account_id: int | None = Field(default=None, foreign_key="senderaccount.id", index=True)
+    template_id: int | None = Field(default=None, foreign_key="emailtemplate.id", index=True)
+    signature_template_id: int | None = Field(default=None, foreign_key="emailtemplate.id", index=True)
     sender_email: str = Field(index=True)
     recipient_email: str = Field(index=True)
     subject: str
@@ -187,3 +194,62 @@ class AppSetting(SQLModel, table=True):
     key: str = Field(index=True, unique=True)
     value: str = Field(default="", sa_column=Column(Text))
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class CompanySourceLink(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("source_system", "external_company_id", name="uq_companysourcelink_source_external"),
+        UniqueConstraint("source_system", "company_id", name="uq_companysourcelink_source_company"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    source_system: str = Field(default="BDdb", index=True)
+    external_company_id: str = Field(index=True)
+    company_id: int = Field(foreign_key="company.id", index=True)
+    source_domain: str | None = Field(default=None, index=True)
+    match_method: str = Field(default="external_id")
+    is_blocked: bool = Field(default=False, index=True)
+    last_seen_fingerprint: str | None = Field(default=None, index=True)
+    last_synced_at: datetime | None = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class BdMasterSyncRun(SQLModel, table=True):
+    id: str = Field(primary_key=True)
+    source_system: str = Field(default="BDdb", index=True)
+    source_path: str = Field(default="", sa_column=Column(Text))
+    source_fingerprint: str = Field(default="", index=True)
+    source_mtime_ns: int | None = None
+    dry_run: bool = Field(default=False, index=True)
+    status: str = Field(index=True)
+    source_company_count: int = 0
+    inserted_companies: int = 0
+    updated_companies: int = 0
+    noop_companies: int = 0
+    inserted_contacts: int = 0
+    updated_contacts: int = 0
+    noop_contacts: int = 0
+    inserted_routes: int = 0
+    inserted_links: int = 0
+    reject_count: int = 0
+    conflict_count: int = 0
+    quarantine_company_count: int = 0
+    quarantine_email_count: int = 0
+    fatal_conflict_count: int = 0
+    error_text: str | None = Field(default=None, sa_column=Column(Text))
+    details_json: str | None = Field(default=None, sa_column=Column(Text))
+    started_at: datetime = Field(default_factory=utc_now, index=True)
+    finished_at: datetime | None = Field(default=None, index=True)
+
+
+class BdMasterSyncConflict(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: str = Field(foreign_key="bdmastersyncrun.id", index=True)
+    conflict_type: str = Field(index=True)
+    external_company_id: str | None = Field(default=None, index=True)
+    domain: str | None = Field(default=None, index=True)
+    email: str | None = Field(default=None, index=True)
+    status: str = Field(default="blocked", index=True)
+    details_json: str = Field(default="{}", sa_column=Column(Text))
+    created_at: datetime = Field(default_factory=utc_now, index=True)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench First Run Check"
+  short_description: "Check version, environment, sender, signature, and Skills"
+  default_prompt: "Use $workbench-first-run-check to prepare this computer for Overseas Marketing Workbench."

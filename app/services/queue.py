@@ -13,17 +13,94 @@ from app.services.email_quality import validate_contact_email
 from app.services.app_settings import is_queue_paused
 from app.services.mailer import send_draft
 from app.services.mailer import validate_attachment_paths
+from app.services.no_go_companies import is_no_go_company
 from app.services.queue_state import reconcile_queue_state
+from app.services.render_validation import SWITCH_TEMPLATE_GUIDANCE, rendered_message_field_issues
+from app.services.signatures import get_signature_template
 from app.services.templates import render_template
 from app.time_utils import local_day_bounds_utc, utc_now
 
-UNRESOLVED_VARIABLE_RE = re.compile(r"{{\s*[^{}]+\s*}}")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_SEND_INTERVAL_SECONDS = 30
 SHARED_RECIPIENT_DOMAINS = {
     "aol.com", "btconnect.com", "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk",
     "icloud.com", "live.com", "outlook.com", "yahoo.com",
 }
+
+
+def sender_timezone(sender: SenderAccount) -> ZoneInfo:
+    """Return the sender-local timezone, retaining the app timezone for legacy rows."""
+    timezone_name = (sender.send_timezone or get_settings().app_timezone).strip()
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        return ZoneInfo(get_settings().app_timezone)
+
+
+def validate_sender_timezone(value: str) -> str:
+    timezone_name = (value or "").strip()
+    if not timezone_name:
+        raise ValueError("Sender timezone is required.")
+    try:
+        ZoneInfo(timezone_name)
+    except Exception as exc:
+        raise ValueError("Sender timezone must be a valid IANA name, such as Europe/London.") from exc
+    return timezone_name
+
+
+def _parse_window_time(value: str):
+    value = value.strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).time()
+        except ValueError:
+            continue
+    raise ValueError("Each send window must use HH:MM-HH:MM format.")
+
+
+def parse_sender_windows_text(value: str, *, fallback_start=None, fallback_end=None) -> str:
+    """Validate a comma/newline-separated daytime window list and serialize it."""
+    raw = (value or "").replace("\n", ",").strip(" ,")
+    if not raw:
+        if fallback_start is None or fallback_end is None:
+            raise ValueError("At least one send window is required.")
+        raw = f"{fallback_start.strftime('%H:%M')}-{fallback_end.strftime('%H:%M')}"
+    windows: list[tuple[object, object]] = []
+    for entry in [part.strip() for part in raw.split(",") if part.strip()]:
+        match = re.fullmatch(r"(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)", entry)
+        if not match:
+            raise ValueError("Use comma-separated daytime windows, for example 09:30-11:30, 14:00-16:30.")
+        start, end = _parse_window_time(match.group(1)), _parse_window_time(match.group(2))
+        if start >= end:
+            raise ValueError("Multiple send windows must be daytime ranges with start before end.")
+        windows.append((start, end))
+    if not windows or len(windows) > 8:
+        raise ValueError("Configure between 1 and 8 send windows.")
+    windows.sort(key=lambda item: item[0])
+    for previous, current in zip(windows, windows[1:]):
+        if current[0] <= previous[1]:
+            raise ValueError("Send windows cannot overlap or touch.")
+    return json.dumps(
+        [{"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")} for start, end in windows],
+        separators=(",", ":"),
+    )
+
+
+def sender_windows(sender: SenderAccount) -> list[tuple[object, object]]:
+    """Return normalized configured windows, or the legacy single-window fallback."""
+    try:
+        payload = json.loads(sender.send_windows_json or "")
+        if isinstance(payload, list) and payload:
+            parsed = [(_parse_window_time(item["start"]), _parse_window_time(item["end"])) for item in payload]
+            if all(start < end for start, end in parsed):
+                return sorted(parsed, key=lambda item: item[0])
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        pass
+    return [(sender.window_start, sender.window_end)]
+
+
+def format_sender_windows(sender: SenderAccount) -> str:
+    return ", ".join(f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')}" for start, end in sender_windows(sender))
 
 
 def recipient_company_domain(email: str | None) -> str | None:
@@ -38,10 +115,20 @@ def recipient_company_domain(email: str | None) -> str | None:
 
 def audit_draft(session: Session, draft: EmailDraft) -> list[str]:
     contact = session.get(Contact, draft.contact_id)
+    company = session.get(Company, draft.company_id)
     issues: list[str] = []
-    unresolved = sorted(set(UNRESOLVED_VARIABLE_RE.findall(f"{draft.subject}\n{draft.body_html}\n{draft.body_text or ''}")))
-    if unresolved:
-        issues.append(f"Template variables not rendered: {', '.join(unresolved)}")
+    rendered_field_issues = rendered_message_field_issues(
+        subject=draft.subject,
+        body_html=draft.body_html,
+        body_text=draft.body_text,
+        recipient_email=contact.email if contact else None,
+        cc_emails=draft.cc_emails,
+    )
+    if rendered_field_issues:
+        issues.append(
+            f"Template field resolution failed: {'; '.join(rendered_field_issues)}. "
+            f"{SWITCH_TEMPLATE_GUIDANCE}"
+        )
     if contact is None:
         issues.append("Contact not found.")
     else:
@@ -52,6 +139,10 @@ def audit_draft(session: Session, draft: EmailDraft) -> list[str]:
             issues.append(f"Invalid recipient email: {contact.email}")
         elif session.exec(select(Suppression).where(Suppression.email == contact.email.strip().lower())).first():
             issues.append(f"Recipient is in suppression list: {contact.email}")
+    if company is None:
+        issues.append("Company not found.")
+    elif is_no_go_company(company):
+        issues.append(f"Company is in NO-GO list: {company.name}")
     if draft.cc_emails:
         invalid_cc = [
             email.strip()
@@ -114,8 +205,15 @@ def approve_draft(session: Session, draft_id: int) -> EmailDraft:
     return draft
 
 
-def daily_sent_count(session: Session, sender_id: int) -> int:
-    start, end = local_day_bounds_utc()
+def daily_sent_count(session: Session, sender: SenderAccount | int) -> int:
+    sender_id = sender.id if isinstance(sender, SenderAccount) else sender
+    if isinstance(sender, SenderAccount):
+        local_now = utc_now().astimezone(sender_timezone(sender))
+        start_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = start_local.astimezone(timezone.utc)
+        end = (start_local + timedelta(days=1)).astimezone(timezone.utc)
+    else:
+        start, end = local_day_bounds_utc()
     return session.exec(
         select(func.count(SendRecord.id)).where(
             SendRecord.sender_account_id == sender_id,
@@ -127,22 +225,27 @@ def daily_sent_count(session: Session, sender_id: int) -> int:
 
 def next_window_start(sender: SenderAccount, now: datetime | None = None) -> datetime:
     now = now or utc_now()
-    timezone = ZoneInfo(get_settings().app_timezone)
-    local_now = now.astimezone(timezone)
-    if _is_time_inside_window(local_now.time(), sender.window_start, sender.window_end):
-        return now
-    start_today = datetime.combine(local_now.date(), sender.window_start, tzinfo=timezone)
-    if local_now.time() < sender.window_start:
-        return start_today.astimezone(ZoneInfo("UTC"))
-    return (start_today + timedelta(days=1)).astimezone(ZoneInfo("UTC"))
+    local_timezone = sender_timezone(sender)
+    local_now = now.astimezone(local_timezone)
+    windows = sender_windows(sender)
+    for window_start, window_end in windows:
+        if _is_time_inside_window(local_now.time(), window_start, window_end):
+            return now
+        if local_now.time() < window_start:
+            return datetime.combine(local_now.date(), window_start, tzinfo=local_timezone).astimezone(timezone.utc)
+    return datetime.combine(local_now.date() + timedelta(days=1), windows[0][0], tzinfo=local_timezone).astimezone(timezone.utc)
 
 
 def next_daily_window_start(sender: SenderAccount, now: datetime | None = None) -> datetime:
     now = now or utc_now()
-    timezone = ZoneInfo(get_settings().app_timezone)
-    local_now = now.astimezone(timezone)
-    start_next_day = datetime.combine(local_now.date() + timedelta(days=1), sender.window_start, tzinfo=timezone)
-    return start_next_day.astimezone(ZoneInfo("UTC"))
+    local_timezone = sender_timezone(sender)
+    local_now = now.astimezone(local_timezone)
+    start_next_day = datetime.combine(local_now.date() + timedelta(days=1), sender_windows(sender)[0][0], tzinfo=local_timezone)
+    return start_next_day.astimezone(timezone.utc)
+
+
+def next_allowed_send_time(sender: SenderAccount, candidate: datetime) -> datetime:
+    return next_window_start(sender, candidate)
 
 
 def sender_interval_seconds(sender: SenderAccount) -> int:
@@ -166,7 +269,7 @@ def _ordered_sender_queue(session: Session, sender_id: int) -> list[EmailDraft]:
 
 def _next_sender_queue_slot(session: Session, sender: SenderAccount) -> datetime:
     candidate = next_window_start(sender)
-    if daily_sent_count(session, sender.id) >= sender.daily_limit:
+    if daily_sent_count(session, sender) >= sender.daily_limit:
         candidate = next_daily_window_start(sender)
 
     latest = session.exec(
@@ -176,8 +279,11 @@ def _next_sender_queue_slot(session: Session, sender: SenderAccount) -> datetime
     ).first()
     if latest and latest.scheduled_at:
         latest_at = _as_aware_utc(latest.scheduled_at)
-        if latest_at >= candidate:
-            return latest_at + timedelta(seconds=sender_interval_seconds(sender))
+        next_after_latest = latest_at + timedelta(
+            seconds=sender_interval_seconds(sender)
+        )
+        if next_after_latest > candidate:
+            return next_allowed_send_time(sender, next_after_latest)
     return candidate
 
 
@@ -189,7 +295,7 @@ def _reschedule_sender_queue_from(session: Session, sender: SenderAccount, start
         draft.updated_at = utc_now()
         session.add(draft)
         session.add(EmailEvent(draft_id=draft.id, event_type=event_type))
-        schedule_at = schedule_at + timedelta(seconds=sender_interval_seconds(sender))
+        schedule_at = next_allowed_send_time(sender, schedule_at + timedelta(seconds=sender_interval_seconds(sender)))
     return len(queued_drafts)
 
 
@@ -304,7 +410,9 @@ def refresh_draft_from_template(
     if company is None or contact is None:
         raise ValueError("Missing company or contact.")
     subject, html, text, snapshot = render_template(template, company, contact, session=session, sender=sender)
+    signature_template = get_signature_template(session)
     draft.template_id = template.id
+    draft.signature_template_id = signature_template.id if signature_template else None
     draft.subject = subject
     draft.body_html = html
     draft.body_text = text
@@ -334,8 +442,8 @@ def _is_time_inside_window(current_time, window_start, window_end) -> bool:
 
 
 def _inside_sender_window(sender: SenderAccount, now: datetime) -> bool:
-    local = now.astimezone(ZoneInfo(get_settings().app_timezone)).time()
-    return _is_time_inside_window(local, sender.window_start, sender.window_end)
+    local = now.astimezone(sender_timezone(sender)).time()
+    return any(_is_time_inside_window(local, window_start, window_end) for window_start, window_end in sender_windows(sender))
 
 
 def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | None = None) -> dict[str, int | bool]:
@@ -379,7 +487,7 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
                 failed += 1
             elif not _inside_sender_window(sender, utc_now()):
                 draft.scheduled_at = next_window_start(sender)
-            elif daily_sent_count(session, sender.id) >= sender.daily_limit:
+            elif daily_sent_count(session, sender) >= sender.daily_limit:
                 if sender.id not in deferred_sender_ids:
                     deferred += _reschedule_sender_queue_from(
                         session,
@@ -421,11 +529,13 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
                                 company_id=draft.company_id,
                                 contact_id=draft.contact_id,
                                 sender_account_id=sender.id,
+                                template_id=draft.template_id,
+                                signature_template_id=draft.signature_template_id,
                                 sender_email=sender.email,
                                 recipient_email=contact.email,
                                 subject=draft.subject,
-                                body_html=draft.body_html,
-                                body_text=draft.body_text,
+                                body_html="",
+                                body_text=None,
                                 cc_emails=draft.cc_emails,
                                 attachment_paths=draft.attachment_paths,
                                 smtp_status="sent",
@@ -433,6 +543,16 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
                             )
                         )
                         sent += 1
+                    if send_result in {"sent", "simulated"}:
+                        draft.body_html = ""
+                        draft.body_text = None
+                        draft.template_snapshot = json.dumps(
+                            {
+                                "template_id": draft.template_id,
+                                "signature_template_id": draft.signature_template_id,
+                            },
+                            ensure_ascii=False,
+                        )
                 except Exception as exc:
                     draft.status = "failed"
                     draft.error_message = str(exc)
@@ -477,6 +597,7 @@ def scan_followups(session: Session) -> dict[str, int]:
             ).first()
             if existing:
                 continue
+            signature_template = get_signature_template(session)
             try:
                 subject, html, text, snapshot = render_template(template, company, contact, session=session)
                 render_error = None
@@ -490,6 +611,7 @@ def scan_followups(session: Session) -> dict[str, int]:
                 company_id=company.id,
                 contact_id=contact.id,
                 template_id=template.id,
+                signature_template_id=signature_template.id if signature_template else None,
                 subject=subject,
                 body_html=html,
                 body_text=text,

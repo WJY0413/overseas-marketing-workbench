@@ -40,7 +40,7 @@
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>发送时间</th><th>状态</th><th>公司</th><th>联系人</th><th>收件邮箱</th><th>发件邮箱</th><th>Subject</th><th>内容</th></tr>
+                <tr><th>发送时间</th><th>状态</th><th>公司</th><th>联系人</th><th>收件邮箱</th><th>发件邮箱</th><th>Subject</th><th>模板引用</th></tr>
               </thead>
               <tbody>
                 {% for record in send_records %}
@@ -55,12 +55,25 @@
                     <td>{{ record.sender_email }}</td>
                     <td>{{ record.subject }}</td>
                     <td>
-                      <details class="preview">
-                        <summary>查看邮件</summary>
-                        {% if record.cc_emails %}<p><strong>CC：</strong>{{ record.cc_emails }}</p>{% endif %}
-                        {% if record.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(record.attachment_paths) }}</p>{% endif %}
-                        <div class="preview-body">{{ record.body_html | safe }}</div>
-                      </details>
+                      {% set mail_template = template_by_id.get(record.template_id) %}
+                      {% set signature_template = template_by_id.get(record.signature_template_id) %}
+                      <div><strong>邮件模板：</strong>
+                        {% if record.template_id %}
+                          #{{ record.template_id }} {{ mail_template.name if mail_template else "(已归档)" }}
+                        {% else %}
+                          legacy / unknown
+                        {% endif %}
+                      </div>
+                      <div><strong>签名模板：</strong>
+                        {% if record.signature_template_id %}
+                          #{{ record.signature_template_id }} {{ signature_template.name if signature_template else "(已归档)" }}
+                        {% else %}
+                          legacy / unknown
+                        {% endif %}
+                      </div>
+                      {% if record.cc_emails %}<div><strong>CC：</strong>{{ record.cc_emails }}</div>{% endif %}
+                      {% if record.attachment_paths %}<div><strong>附件：</strong>{{ attachment_paths_text(record.attachment_paths) }}</div>{% endif %}
+                      <small>正文不在发送记录中重复保存。</small>
                     </td>
                   </tr>
                 {% endfor %}

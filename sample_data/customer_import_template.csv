@@ -1,0 +1,5 @@
+﻿id,company_name,country,type,contact_name,position,email,linkedin,whatsapp,source,current_status,priority,notes
+1,Northfield Robotics,United Kingdom,Distributor,Alex Morgan,Sales Manager,alex.morgan@example.com,https://www.linkedin.com/in/example,,Website,new,A,Fictional distributor sample
+2,Northfield Robotics,United Kingdom,Distributor,Jamie Reed,Marketing Manager,jamie.reed@example.com,,,Website,new,A,Fictional secondary contact sample
+3,Greenway Equipment,Germany,Dealer,Anna Keller,Business Development Manager,anna.keller@example.com,,,Exhibition,new,B,Fictional dealer sample
+4,Turf Automation Asia,Singapore,Distributor,Daniel Tan,General Manager,daniel.tan@example.com,,,Website,new,A,Fictional Southeast Asia distributor sample

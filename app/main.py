@@ -1,4 +1,5 @@
-import json
+﻿import json
+import logging
 import re
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
@@ -16,19 +17,28 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.db import create_db_and_tables, engine, get_session
 from app.models import BounceRecord, Company, Contact, ContactRoute, DraftPrepItem, EmailDraft, EmailEvent, EmailTemplate, FollowUpRule, SendRecord, SenderAccount, Suppression
-from app.scheduler import start_scheduler, stop_scheduler
+from app.scheduler import scheduler, start_scheduler, stop_scheduler
 from app.seed import seed_defaults
 from app.services.docx_templates import parse_docx_email_template, parse_docx_signature_html
 from app.services.importer import import_bd_json_candidates, import_contacts, is_generic_email
+from app.services.no_go_companies import (
+    import_no_go_companies,
+    is_no_go_company,
+    parse_no_go_company_file,
+)
 from app.services.email_quality import validate_contact_email
 from app.services.app_settings import is_queue_paused, set_app_setting
+from app.services.bd_master_sync import get_bd_master_sync_status, run_bd_master_sync
 from app.services.queue import (
     audit_draft,
     apply_audit_result,
     approve_draft,
     cancel_queued_draft,
     daily_sent_count,
+    format_sender_windows,
     next_window_start,
+    next_allowed_send_time,
+    parse_sender_windows_text,
     process_due_queue,
     queue_draft,
     recipient_company_domain,
@@ -37,6 +47,9 @@ from app.services.queue import (
     refresh_pending_audits,
     scan_followups,
     sender_interval_seconds,
+    sender_windows,
+    sender_timezone,
+    validate_sender_timezone,
 )
 from app.services.reports import export_sending_report
 from app.services.bounce_scanner import bounce_log_path, scan_bounces
@@ -65,7 +78,8 @@ from app.services.templates import render_template
 from app.time_utils import display_dt, local_now, utc_now
 from app.version import APP_VERSION
 
-app = FastAPI(title="BD Email Workbench Lite")
+app = FastAPI(title="海外营销 Workbench")
+logger = logging.getLogger(__name__)
 templates = Jinja2Templates(directory="app/templates")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 PIXEL = b64decode("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==")
@@ -82,13 +96,8 @@ templates.env.globals["attachment_paths_text"] = attachment_paths_text
 
 def _clear_startup_workspace(session: Session) -> None:
     session.exec(delete(DraftPrepItem))
-    session.exec(
-        delete(EmailDraft).where(
-            EmailDraft.status.in_(["pending_review", "approved", "failed", "skipped", "simulated"]),
-            EmailDraft.sent_at == None,
-            EmailDraft.scheduled_at == None,
-        )
-    )
+    # EmailDraft is durable review/queue evidence. A Workbench restart must
+    # never erase a prepared batch before the native handoff can process it.
 
 
 @app.on_event("startup")
@@ -101,9 +110,28 @@ def startup() -> None:
         _clear_startup_workspace(session)
         session.commit()
     seed_defaults()
-    with Session(engine) as session:
-        sync_power_awake(session)
-    start_scheduler()
+    try:
+        sync_result = run_bd_master_sync(engine, settings.bd_database_path)
+    except Exception as exc:
+        logger.exception("BD master startup sync raised before it could persist a failed audit run.")
+        sync_result = {
+            "status": "failed",
+            "run_id": None,
+            "error": str(exc),
+            "scheduler_safe": False,
+        }
+    if sync_result["scheduler_safe"]:
+        with Session(engine) as session:
+            sync_power_awake(session)
+        start_scheduler()
+    else:
+        stop_scheduler()
+        logger.error(
+            "BD master startup sync blocked the scheduler: status=%s run_id=%s error=%s",
+            sync_result.get("status"),
+            sync_result.get("run_id"),
+            sync_result.get("error"),
+        )
 
 
 @app.on_event("shutdown")
@@ -219,10 +247,47 @@ def _deactivate_same_name_templates(session: Session, template_id: int | None, n
             session.add(duplicate)
 
 
+def _create_mail_template_version(
+    session: Session,
+    *,
+    name: str,
+    template_type: str,
+    subject: str,
+    body_html: str,
+    body_text: str | None,
+    cc_enabled: bool,
+    cc_emails: str | None,
+    is_active: bool = True,
+    replaces_template_id: int | None = None,
+) -> EmailTemplate:
+    template = EmailTemplate(
+        name=name.strip(),
+        template_type=template_type,
+        subject=subject.strip(),
+        body_html=body_html,
+        body_text=body_text or None,
+        cc_enabled=cc_enabled,
+        cc_emails=cc_emails.strip() if cc_emails and cc_emails.strip() else None,
+        is_active=is_active,
+    )
+    session.add(template)
+    session.flush()
+    _deactivate_same_name_templates(session, template.id, template.name)
+    if replaces_template_id is not None and is_active:
+        rules = session.exec(
+            select(FollowUpRule).where(FollowUpRule.template_id == replaces_template_id)
+        ).all()
+        for rule in rules:
+            rule.template_id = template.id
+            rule.updated_at = utc_now()
+            session.add(rule)
+    return template
+
+
 def _dashboard_stats(session: Session) -> dict[str, int]:
     senders = session.exec(select(SenderAccount).where(SenderAccount.email != PLACEHOLDER_SENDER_EMAIL)).all()
     return {
-        "sent_today": sum(daily_sent_count(session, sender.id) for sender in senders),
+        "sent_today": sum(daily_sent_count(session, sender) for sender in senders),
         "queued": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "queued")).one(),
         "approved": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "approved")).one(),
         "audit_exceptions": session.exec(
@@ -248,9 +313,11 @@ def _sender_usage(session: Session) -> list[dict]:
     return [
         {
             "sender": sender,
-            "sent_today": daily_sent_count(session, sender.id),
-            "remaining": max(sender.daily_limit - daily_sent_count(session, sender.id), 0),
+            "sent_today": daily_sent_count(session, sender),
+            "remaining": max(sender.daily_limit - daily_sent_count(session, sender), 0),
             "advice": get_sending_limit_advice(sender),
+            "send_timezone": sender_timezone(sender).key,
+            "send_windows": format_sender_windows(sender),
         }
         for sender in senders
     ]
@@ -320,7 +387,7 @@ def _reschedule_sender_queue(session: Session, sender: SenderAccount) -> int:
         draft.updated_at = utc_now()
         session.add(draft)
         session.add(EmailEvent(draft_id=draft.id, event_type="sender_window_rescheduled"))
-        schedule_at = schedule_at + timedelta(seconds=sender_interval_seconds(sender))
+        schedule_at = next_allowed_send_time(sender, schedule_at + timedelta(seconds=sender_interval_seconds(sender)))
     return len(queued_drafts)
 
 
@@ -397,7 +464,7 @@ def _company_cc_emails(session: Session, company_id: int, primary_contact: Conta
         email = (contact.email or "").strip().lower()
         if email and email != primary_contact.email.lower() and _is_cc_contact(contact) and email not in emails:
             emails.append(email)
-    return ", ".join(emails) or None
+    return emails[0] if emails else None
 
 
 def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, contact_ids: list[int]) -> dict[str, int]:
@@ -472,6 +539,7 @@ def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, con
             if refreshed_existing:
                 generated_contact_ids.add(contact.id)
             continue
+        signature_template = get_signature_template(session)
         try:
             subject, html, text, snapshot = render_template(template, company, contact, session=session)
             render_error = None
@@ -485,6 +553,7 @@ def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, con
             company_id=company.id,
             contact_id=contact.id,
             template_id=template.id,
+            signature_template_id=signature_template.id if signature_template else None,
             subject=subject,
             body_html=html,
             body_text=text,
@@ -708,6 +777,39 @@ def _duplicate_company_batch_names(session: Session, drafts: list[EmailDraft], l
     return labels
 
 
+def _dedupe_batch_drafts(session: Session, drafts: list[EmailDraft]) -> tuple[list[EmailDraft], list[str]]:
+    """Keep the first confirmed draft for each company and enterprise email domain."""
+    kept: list[EmailDraft] = []
+    exclusions: list[str] = []
+    seen_company_ids: set[int] = set()
+    seen_domains: set[str] = set()
+    for draft in drafts:
+        company = session.get(Company, draft.company_id)
+        company_name = company.name if company else f"Company #{draft.company_id}"
+        contact = session.get(Contact, draft.contact_id)
+        domain = recipient_company_domain(contact.email if contact else None)
+        reason = None
+        if draft.company_id in seen_company_ids:
+            reason = "duplicate company"
+        elif domain and domain in seen_domains:
+            reason = f"duplicate enterprise domain {domain}"
+        if reason:
+            draft.status = "pending_review"
+            draft.sender_account_id = None
+            draft.scheduled_at = None
+            draft.approved_at = None
+            draft.error_message = f"Excluded from this batch: {reason}."
+            draft.updated_at = utc_now()
+            session.add(draft)
+            exclusions.append(f"Draft #{draft.id}: {reason} for {company_name}")
+            continue
+        kept.append(draft)
+        seen_company_ids.add(draft.company_id)
+        if domain:
+            seen_domains.add(domain)
+    return kept, exclusions
+
+
 @app.get("/")
 def index(
     request: Request,
@@ -884,8 +986,19 @@ def send_records_page(request: Request, message: str = "", session: Session = De
     send_records = session.exec(select(SendRecord).order_by(SendRecord.sent_at.desc()).limit(1000)).all()
     company_ids = {record.company_id for record in send_records}
     contact_ids = {record.contact_id for record in send_records}
+    template_ids = {
+        template_id
+        for record in send_records
+        for template_id in (record.template_id, record.signature_template_id)
+        if template_id is not None
+    }
     companies = session.exec(select(Company).where(Company.id.in_(company_ids))).all() if company_ids else []
     contacts = session.exec(select(Contact).where(Contact.id.in_(contact_ids))).all() if contact_ids else []
+    email_templates = (
+        session.exec(select(EmailTemplate).where(EmailTemplate.id.in_(template_ids))).all()
+        if template_ids
+        else []
+    )
     return templates.TemplateResponse(
         "send_records.html",
         {
@@ -897,6 +1010,7 @@ def send_records_page(request: Request, message: str = "", session: Session = De
             "send_record_count": session.exec(select(func.count(SendRecord.id))).one(),
             "company_by_id": {company.id: company for company in companies},
             "contact_by_id": {contact.id: contact for contact in contacts},
+            "template_by_id": {template.id: template for template in email_templates},
             "stats": _dashboard_stats(session),
             "display_dt": display_dt,
         },
@@ -962,12 +1076,12 @@ def update_signature_settings(
     enabled: bool = Form(False),
     sender_name: str = Form("Your Name"),
     title_prefix: str = Form("Regional Manager"),
-    company_name: str = Form("Example Company"),
+    company_name: str = Form("Your Company"),
     default_region: str = Form("UK"),
-    default_email: str = Form("your.name@example.com"),
-    default_phone: str = Form(""),
-    western_phone: str = Form(""),
-    southeast_asia_phone: str = Form(""),
+    default_email: str = Form("sender@example.com"),
+    default_phone: str = Form("+1 555 0100"),
+    western_phone: str = Form("+1 555 0100"),
+    southeast_asia_phone: str = Form("+1 555 0101"),
     address: str = Form(""),
     country_rules_text: str = Form(""),
     sender_rules_text: str = Form(""),
@@ -982,7 +1096,7 @@ def update_signature_settings(
             "enabled": enabled,
             "sender_name": sender_name.strip() or "Your Name",
             "title_prefix": title_prefix.strip() or "Regional Manager",
-            "company_name": company_name.strip() or "Example Company",
+            "company_name": company_name.strip() or "Your Company",
             "default_region": default_region.strip() or "UK",
             "default_email": default_email.strip().lower(),
             "default_phone": default_phone.strip(),
@@ -1021,7 +1135,9 @@ def crm_page(request: Request, message: str = "", session: Session = Depends(get
     companies = session.exec(select(Company).order_by(Company.updated_at.desc())).all()
     contacts = session.exec(select(Contact).order_by(Contact.created_at.desc())).all()
     routes_by_contact = _routes_by_contact(session, [contact.id for contact in contacts if contact.id is not None])
-    company_rows = _crm_company_rows(companies, contacts, routes_by_contact)
+    all_company_rows = _crm_company_rows(companies, contacts, routes_by_contact)
+    company_rows = [row for row in all_company_rows if not is_no_go_company(row["company"])]
+    no_go_company_rows = [row for row in all_company_rows if is_no_go_company(row["company"])]
     return templates.TemplateResponse(
         "crm.html",
         {
@@ -1032,10 +1148,39 @@ def crm_page(request: Request, message: str = "", session: Session = Depends(get
             "companies": companies,
             "contacts": contacts,
             "company_rows": company_rows,
+            "crm_contact_count": sum(row["contact_count"] for row in company_rows),
+            "no_go_company_rows": no_go_company_rows,
             "routes_by_contact": routes_by_contact,
             "stats": _dashboard_stats(session),
             "display_dt": display_dt,
         },
+    )
+
+
+@app.post("/crm/no-go/import")
+async def import_no_go_company_list(
+    file: UploadFile | None = None,
+    session: Session = Depends(get_session),
+):
+    if file is None or not file.filename:
+        return _redirect_to("/crm", "请选择 NO-GO 公司文件。")
+    payload = await file.read()
+    if len(payload) > 5 * 1024 * 1024:
+        return _redirect_to("/crm", "NO-GO 文件超过 5 MB，请缩小后重试。")
+    try:
+        names = parse_no_go_company_file(payload, file.filename)
+    except ValueError as exc:
+        return _redirect_to("/crm", str(exc))
+    source_label = Path(file.filename).name
+    try:
+        result = import_no_go_companies(session, names, source_label)
+    except ValueError as exc:
+        return _redirect_to("/crm", str(exc))
+    return _redirect_to(
+        "/crm",
+        "NO-GO 公司导入完成："
+        f"输入={result['input']}，新增={result['created']}，拉黑现有={result['updated']}，"
+        f"已在名单={result['already_no_go']}，重复={result['duplicates']}。",
     )
 
 
@@ -1248,7 +1393,9 @@ def update_draft_prep_contact(
 @app.get("/templates")
 def templates_page(request: Request, message: str = "", session: Session = Depends(get_session)):
     email_templates = session.exec(
-        select(EmailTemplate).where(mail_template_filter()).order_by(EmailTemplate.created_at.desc())
+        select(EmailTemplate)
+        .where(mail_template_filter(), EmailTemplate.is_active == True)
+        .order_by(EmailTemplate.created_at.desc())
     ).all()
     signature_template = get_signature_template(session)
     return templates.TemplateResponse(
@@ -1279,23 +1426,18 @@ def create_template(
 ):
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    template = session.exec(select(EmailTemplate).where(EmailTemplate.name == name.strip())).first()
-    if template is None:
-        template = EmailTemplate(name=name.strip(), template_type=template_type, subject=subject.strip(), body_html=body_html)
-    template.name = name.strip()
-    template.template_type = template_type
-    template.subject = subject.strip()
-    template.body_html = body_html
-    template.body_text = body_text or None
-    template.cc_enabled = cc_enabled
-    template.cc_emails = cc_emails.strip() or None
-    template.is_active = True
-    template.updated_at = utc_now()
-    session.add(template)
-    session.flush()
-    _deactivate_same_name_templates(session, template.id, template.name)
+    _create_mail_template_version(
+        session,
+        name=name,
+        template_type=template_type,
+        subject=subject,
+        body_html=body_html,
+        body_text=body_text,
+        cc_enabled=cc_enabled,
+        cc_emails=cc_emails,
+    )
     session.commit()
-    return _redirect_to("/templates", "Template saved.")
+    return _redirect_to("/templates", "Template version saved with a new immutable ID.")
 
 
 @app.post("/templates/signature")
@@ -1358,20 +1500,23 @@ def update_template(
         return _redirect_to("/templates", "Template not found.")
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    template.name = name.strip()
-    template.template_type = template_type
-    template.subject = subject.strip()
-    template.body_html = body_html
-    template.body_text = body_text or None
-    template.cc_enabled = cc_enabled
-    template.cc_emails = cc_emails.strip() or None
-    template.is_active = is_active
-    template.updated_at = utc_now()
-    session.add(template)
-    session.flush()
-    _deactivate_same_name_templates(session, template.id, template.name)
+    new_template = _create_mail_template_version(
+        session,
+        name=name,
+        template_type=template_type,
+        subject=subject,
+        body_html=body_html,
+        body_text=body_text,
+        cc_enabled=cc_enabled,
+        cc_emails=cc_emails,
+        is_active=is_active,
+        replaces_template_id=template.id,
+    )
     session.commit()
-    return _redirect_to("/templates", "Template updated.")
+    return _redirect_to(
+        "/templates",
+        f"Template version saved. Previous ID={template.id}; new ID={new_template.id}.",
+    )
 
 
 @app.post("/templates/{template_id}/delete")
@@ -1381,15 +1526,22 @@ def delete_template(template_id: int, session: Session = Depends(get_session)):
         return _redirect_to("/templates", "Template not found.")
 
     draft_count = session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.template_id == template_id)).one()
+    send_count = session.exec(
+        select(func.count(SendRecord.id)).where(
+            (SendRecord.template_id == template_id)
+            | (SendRecord.signature_template_id == template_id)
+        )
+    ).one()
     rule_count = session.exec(select(func.count(FollowUpRule.id)).where(FollowUpRule.template_id == template_id)).one()
-    if draft_count or rule_count:
+    if draft_count or send_count or rule_count:
         template.is_active = False
         template.updated_at = utc_now()
         session.add(template)
         session.commit()
         return _redirect_to(
             "/templates",
-            f"Template is used by {draft_count} draft(s) and {rule_count} follow-up rule(s), so it was deactivated instead of deleted.",
+            f"Template is used by {draft_count} draft(s), {send_count} send record(s), and "
+            f"{rule_count} follow-up rule(s), so it was deactivated instead of deleted.",
         )
 
     template_name = template.name
@@ -1416,23 +1568,18 @@ async def import_template_file(
         return _redirect_to("/templates", "Template file is empty.")
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    template = session.exec(select(EmailTemplate).where(EmailTemplate.name == name.strip())).first()
-    if template is None:
-        template = EmailTemplate(name=name.strip(), template_type=template_type, subject=subject.strip(), body_html=body_html)
-    template.name = name.strip()
-    template.template_type = template_type
-    template.subject = subject.strip()
-    template.body_html = body_html
-    template.body_text = body_text or None
-    template.cc_enabled = False
-    template.cc_emails = None
-    template.is_active = True
-    template.updated_at = utc_now()
-    session.add(template)
-    session.flush()
-    _deactivate_same_name_templates(session, template.id, template.name)
+    _create_mail_template_version(
+        session,
+        name=name,
+        template_type=template_type,
+        subject=subject,
+        body_html=body_html,
+        body_text=body_text,
+        cc_enabled=False,
+        cc_emails=None,
+    )
     session.commit()
-    return _redirect_to("/templates", "Template imported from file.")
+    return _redirect_to("/templates", "Template imported as a new immutable version.")
 
 
 @app.post("/templates/import-docx")
@@ -1453,23 +1600,18 @@ async def import_docx_template_file(
         subject, body_html, body_text = parse_docx_email_template(payload, fallback_subject=subject)
     except ValueError as exc:
         return _redirect_to("/templates", str(exc))
-    template = session.exec(select(EmailTemplate).where(EmailTemplate.name == template_name)).first()
-    if template is None:
-        template = EmailTemplate(name=template_name, template_type=template_type, subject=subject.strip(), body_html=body_html)
-    template.name = template_name
-    template.template_type = template_type
-    template.subject = subject.strip()
-    template.body_html = body_html
-    template.body_text = body_text
-    template.cc_enabled = False
-    template.cc_emails = None
-    template.is_active = True
-    template.updated_at = utc_now()
-    session.add(template)
-    session.flush()
-    _deactivate_same_name_templates(session, template.id, template.name)
+    _create_mail_template_version(
+        session,
+        name=template_name,
+        template_type=template_type,
+        subject=subject,
+        body_html=body_html,
+        body_text=body_text,
+        cc_enabled=False,
+        cc_emails=None,
+    )
     session.commit()
-    return _redirect_to("/templates", f"DOCX template imported. Subject: {subject}")
+    return _redirect_to("/templates", f"DOCX template imported as a new immutable version. Subject: {subject}")
 
 
 @app.post("/senders")
@@ -1484,6 +1626,8 @@ def create_sender(
     daily_limit: int = Form(30),
     window_start: str = Form("09:30"),
     window_end: str = Form("17:30"),
+    send_timezone: str = Form("Europe/London"),
+    send_windows: str = Form("09:30-11:30, 14:00-16:30"),
     interval_mode: str = Form("random"),
     random_delay_min_seconds: str = Form("180"),
     random_delay_max_seconds: str = Form("600"),
@@ -1493,6 +1637,12 @@ def create_sender(
 ):
     try:
         parsed_window_start, parsed_window_end = _parse_sender_window(window_start, window_end)
+        parsed_send_timezone = validate_sender_timezone(send_timezone)
+        parsed_send_windows = parse_sender_windows_text(
+            send_windows,
+            fallback_start=parsed_window_start,
+            fallback_end=parsed_window_end,
+        )
         delay_min, delay_max = _parse_delay_settings(
             interval_mode,
             random_delay_min_seconds,
@@ -1512,6 +1662,8 @@ def create_sender(
         daily_limit=daily_limit,
         window_start=parsed_window_start,
         window_end=parsed_window_end,
+        send_timezone=parsed_send_timezone,
+        send_windows_json=parsed_send_windows,
         random_delay_min_seconds=delay_min,
         random_delay_max_seconds=delay_max,
         enable_open_tracking=enable_open_tracking,
@@ -1558,6 +1710,11 @@ def update_sender_window(
         return _redirect_to("/settings", str(exc))
     sender.window_start = parsed_window_start
     sender.window_end = parsed_window_end
+    sender.send_windows_json = parse_sender_windows_text(
+        f"{parsed_window_start.strftime('%H:%M')}-{parsed_window_end.strftime('%H:%M')}",
+        fallback_start=parsed_window_start,
+        fallback_end=parsed_window_end,
+    )
     sender.updated_at = utc_now()
     session.add(sender)
     session.flush()
@@ -1566,10 +1723,9 @@ def update_sender_window(
     session.refresh(sender)
     if sender.window_start != parsed_window_start or sender.window_end != parsed_window_end:
         return _redirect_to("/settings", "Sender window save failed. Please retry after restarting the app.")
-    overnight = " Overnight window enabled." if parsed_window_start > parsed_window_end else ""
     return _redirect_to(
         "/settings",
-        f"Sender window updated to {sender.window_start.strftime('%H:%M')}-{sender.window_end.strftime('%H:%M')}.{overnight} Rescheduled queued drafts: {rescheduled}.",
+        f"Sender window updated to {format_sender_windows(sender)}. Rescheduled queued drafts: {rescheduled}.",
     )
 
 
@@ -1586,6 +1742,8 @@ def update_sender_settings(
     daily_limit: int = Form(30),
     window_start: str = Form("09:30"),
     window_end: str = Form("17:30"),
+    send_timezone: str = Form("Europe/London"),
+    send_windows: str = Form(""),
     interval_mode: str = Form("random"),
     random_delay_min_seconds: str = Form("180"),
     random_delay_max_seconds: str = Form("600"),
@@ -1601,6 +1759,12 @@ def update_sender_settings(
         return _redirect_to("/settings", "Daily max must be at least 1.")
     try:
         parsed_window_start, parsed_window_end = _parse_sender_window(window_start, window_end)
+        parsed_send_timezone = validate_sender_timezone(send_timezone)
+        parsed_send_windows = parse_sender_windows_text(
+            send_windows,
+            fallback_start=parsed_window_start,
+            fallback_end=parsed_window_end,
+        )
         delay_min, delay_max = _parse_delay_settings(
             interval_mode,
             random_delay_min_seconds,
@@ -1621,6 +1785,8 @@ def update_sender_settings(
     sender.daily_limit = daily_limit
     sender.window_start = parsed_window_start
     sender.window_end = parsed_window_end
+    sender.send_timezone = parsed_send_timezone
+    sender.send_windows_json = parsed_send_windows
     sender.random_delay_min_seconds = delay_min
     sender.random_delay_max_seconds = delay_max
     sender.enable_open_tracking = enable_open_tracking
@@ -1631,11 +1797,18 @@ def update_sender_settings(
     rescheduled = _reschedule_sender_queue(session, sender)
     session.commit()
     session.refresh(sender)
-    if sender.window_start != parsed_window_start or sender.window_end != parsed_window_end:
-        return _redirect_to("/settings", "Sender settings saved, but window verification failed. Please retry after restarting the app.")
+    if sender.send_timezone != parsed_send_timezone or format_sender_windows(sender) != format_sender_windows(
+        SenderAccount(
+            name="verification",
+            email="verification@example.com",
+            smtp_host="localhost",
+            send_windows_json=parsed_send_windows,
+        )
+    ):
+        return _redirect_to("/settings", "Sender settings saved, but send-window verification failed. Please retry after restarting the app.")
     return _redirect_to(
         "/settings",
-        f"Sender settings updated. Window: {sender.window_start.strftime('%H:%M')}-{sender.window_end.strftime('%H:%M')}. Rescheduled queued drafts: {rescheduled}.",
+        f"Sender settings updated. Timezone: {sender.send_timezone}; windows: {format_sender_windows(sender)}. Rescheduled queued drafts: {rescheduled}.",
     )
 
 
@@ -1798,14 +1971,16 @@ def start_send_batch(
         send_mode = "single"
     if send_mode == "single":
         senders = senders[:1]
+    local_exclusions: list[str] = []
     selected_drafts = [session.get(EmailDraft, draft_id) for draft_id in draft_ids]
+    missing_draft_ids = [draft_id for draft_id, draft in zip(draft_ids, selected_drafts) if draft is None]
+    if missing_draft_ids:
+        local_exclusions.extend(f"Draft #{draft_id}: missing before handoff" for draft_id in missing_draft_ids)
     selected_drafts = [draft for draft in selected_drafts if draft is not None]
-    duplicate_company_names = _duplicate_company_batch_names(session, selected_drafts)
-    if duplicate_company_names:
-        return _redirect(
-            "Blocked: one company can only have one draft in a send batch. "
-            f"Duplicate company selection: {', '.join(duplicate_company_names)}."
-        )
+    selected_drafts, duplicate_exclusions = _dedupe_batch_drafts(session, selected_drafts)
+    local_exclusions.extend(duplicate_exclusions)
+    if not selected_drafts:
+        return _redirect("Blocked: no confirmed draft remains after local roster exclusions.")
     selected_template_id = int(send_template_id) if send_template_id.strip() else None
     if selected_template_id is not None:
         send_template = session.get(EmailTemplate, selected_template_id)
@@ -1814,6 +1989,7 @@ def start_send_batch(
         if is_signature_template(send_template):
             return _redirect("Signature templates cannot be used as send templates.")
         refresh_errors: list[str] = []
+        refresh_error_ids: set[int] = set()
         for draft in selected_drafts:
             try:
                 refresh_draft_from_template(session, draft, send_template)
@@ -1827,6 +2003,7 @@ def start_send_batch(
                 draft.approved_at = None
                 draft.error_message = "; ".join(issues)
                 refresh_errors.append(f"Draft #{draft.id}: {draft.error_message}")
+                refresh_error_ids.add(draft.id)
             elif draft.status in {"pending_review", "approved"}:
                 draft.status = "approved"
                 draft.approved_at = utc_now()
@@ -1835,19 +2012,37 @@ def start_send_batch(
             session.add(draft)
         session.commit()
         if refresh_errors:
-            return _redirect(f"Template refresh blocked sending. First issue: {refresh_errors[0]}")
+            selected_drafts = [draft for draft in selected_drafts if draft.id not in refresh_error_ids]
+            if not selected_drafts:
+                return _redirect(f"Template refresh blocked all selected drafts. First issue: {refresh_errors[0]}")
     recent_records = recent_company_send_records(session, {draft.company_id for draft in selected_drafts}, hours=8)
+    local_exclusions.extend(refresh_errors)
     if recent_records and not force_recent_send:
-        company_names = []
-        for record in recent_records[:5]:
-            company = session.get(Company, record.company_id)
-            company_names.append(company.name if company else f"Company #{record.company_id}")
-        names = ", ".join(dict.fromkeys(company_names))
-        return _redirect(f"8小时内已有发送记录：{names}。请勾选“忽略8小时提醒，仍然继续发送”后再开始。")
+        recent_company_ids = {record.company_id for record in recent_records}
+        recent_drafts = [draft for draft in selected_drafts if draft.company_id in recent_company_ids]
+        for draft in recent_drafts:
+            company = session.get(Company, draft.company_id)
+            name = company.name if company else f"Company #{draft.company_id}"
+            draft.status = "pending_review"
+            draft.sender_account_id = None
+            draft.scheduled_at = None
+            draft.approved_at = None
+            draft.error_message = "Company has a successful send within the last 8 hours."
+            draft.updated_at = utc_now()
+            session.add(draft)
+            local_exclusions.append(f"Draft #{draft.id}: recent send guard for {name}")
+        session.commit()
+        selected_drafts = [draft for draft in selected_drafts if draft.company_id not in recent_company_ids]
+        if not selected_drafts:
+            return _redirect(
+                "Blocked: all selected drafts are inside the 8-hour recent-send guard. "
+                f"First issue: {local_exclusions[0]}"
+            )
+    draft_ids = [draft.id for draft in selected_drafts]
     set_app_setting(session, "queue_paused", "false")
     queued = 0
     skipped = 0
-    errors: list[str] = []
+    errors: list[str] = list(local_exclusions)
     queued_draft_ids: list[int] = []
     for index, draft_id in enumerate(draft_ids):
         sender = senders[index % len(senders)]
@@ -1867,7 +2062,10 @@ def start_send_batch(
     queue_state = reconcile_queue_state(session)
     sync_power_awake(session)
     if errors:
-        return _redirect(f"Start send completed with issues: queued={queued}, skipped={skipped}, first issue={errors[0]}")
+        return _redirect(
+            f"Started sending with local exclusions: queued={queued}, excluded={len(errors)}, "
+            f"first exclusion={errors[0]}. Current queue={queue_state['queued_count']}."
+        )
     return _redirect(
         f"Started sending: mode={send_mode}, sender_count={len(senders)}, queued {queued} draft(s). Current queue={queue_state['queued_count']}. Immediate processing: sent={processed_now['sent']}, failed={processed_now['failed']}, skipped={processed_now['skipped']}. Minimum interval is strictly 30 seconds."
     )
@@ -2017,3 +2215,10 @@ def report(session: Session = Depends(get_session)):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/sync/bd-database/status")
+def bd_database_sync_status(session: Session = Depends(get_session)):
+    status = get_bd_master_sync_status(session, get_settings().bd_database_path)
+    status["scheduler_running"] = scheduler.running
+    return status

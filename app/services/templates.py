@@ -1,11 +1,13 @@
 import json
+from html import unescape
 
 from jinja2 import Environment, StrictUndefined
 from sqlmodel import Session
 
 from app.config import get_settings
 from app.models import Company, Contact, EmailTemplate, SenderAccount
-from app.services.signatures import append_signature, get_signature_config, signature_context
+from app.services.render_validation import validate_rendered_message, validate_template_context
+from app.services.signatures import append_signature, get_signature_config, get_signature_template, signature_context
 
 env = Environment(undefined=StrictUndefined, autoescape=True)
 
@@ -44,7 +46,8 @@ def render_template(
     sender: SenderAccount | None = None,
 ) -> tuple[str, str, str | None, str]:
     context = context_for(company, contact, sender=sender, session=session)
-    subject = env.from_string(template.subject).render(**context)
+    validate_template_context(template, context, environment=env)
+    subject = unescape(env.from_string(template.subject).render(**context))
     body_html = env.from_string(template.body_html).render(**context)
     body_text = env.from_string(template.body_text).render(**context) if template.body_text else None
     body_html, body_text, rendered_signature = append_signature(
@@ -55,17 +58,19 @@ def render_template(
         contact=contact,
         sender=sender,
     )
+    validate_rendered_message(
+        subject=subject,
+        body_html=body_html,
+        body_text=body_text,
+        recipient_email=contact.email,
+        cc_emails=template.cc_emails if template.cc_enabled else None,
+    )
+    signature_template = get_signature_template(session)
     snapshot = json.dumps(
         {
             "template_id": template.id,
             "template_name": template.name,
-            "subject": template.subject,
-            "body_html": template.body_html,
-            "body_text": template.body_text,
-            "cc_enabled": template.cc_enabled,
-            "cc_emails": template.cc_emails,
-            "context": context,
-            "signature": rendered_signature,
+            "signature_template_id": signature_template.id if signature_template else None,
         },
         ensure_ascii=False,
     )

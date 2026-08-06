@@ -4,7 +4,7 @@ from typing import TypedDict
 from sqlmodel import Session, select
 
 from app.models import EmailDraft, SenderAccount
-from app.services.app_settings import is_queue_paused, set_app_setting
+from app.services.app_settings import is_queue_paused
 
 
 class QueueState(TypedDict):
@@ -25,12 +25,6 @@ def reconcile_queue_state(session: Session, commit: bool = True) -> QueueState:
     ).all()
     queued_count = len(queued_drafts)
     paused = is_queue_paused(session)
-
-    if queued_count == 0 and paused:
-        set_app_setting(session, "queue_paused", "false", commit=False)
-        paused = False
-        if commit:
-            session.commit()
 
     next_draft = queued_drafts[0] if queued_drafts else None
     sender_email = None

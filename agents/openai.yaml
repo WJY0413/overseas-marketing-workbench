@@ -1,4 +1,0 @@
-interface:
-  display_name: "BD Email Workbench Lite"
-  short_description: "Operate local B2B email campaigns with safety gates"
-  default_prompt: "Use $bd-email-workbench-lite to inspect the current email queue, risks, and exact next actions in dry-run mode."

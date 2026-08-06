@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     default_imap_port: int = 993
     dry_run_email: bool = True
     default_sender_name: str = "Your Name"
+    bd_database_json_path: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -36,6 +37,20 @@ class Settings(BaseSettings):
             return self.database_url
         database_path = self.data_dir / "workbench.db"
         return f"sqlite:///{database_path.as_posix()}"
+
+    @property
+    def bd_database_path(self) -> Path | None:
+        if self.bd_database_json_path:
+            return Path(self.bd_database_json_path).expanduser()
+        discovered = (
+            Path.home()
+            / "Documents"
+            / "Overseas Marketing Workbench"
+            / "bd_company_database"
+            / "database"
+            / "bd_company_database.json"
+        )
+        return discovered if discovered.is_file() else None
 
 
 @lru_cache
