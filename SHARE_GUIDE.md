@@ -8,7 +8,7 @@ C:\Overseas_Marketing_Workbench
 
 ## 首次启动
 
-1. 安装 Python 3.12；同时支持 3.11 和 3.13，本版不建议 Python 3.14。
+1. 安装 Python 3，并确保 Windows 可以使用 `py -3`、`python` 或 `python3` 命令。
 2. 双击 `install_skills.cmd` 安装随包 Codex Skills。
 3. 重启 Codex，发送：`请使用 $workbench-first-run-check 检查并完成海外营销 Workbench 首次配置。`
 4. 未发现旧版本时双击 `start.cmd`；如果发现旧版本，优先按检查结果原地升级，避免同时运行两套软件。
