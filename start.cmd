@@ -18,9 +18,9 @@ if not exist ".env" (
 )
 
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)" >nul 2>nul
+  ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)" >nul 2>nul
   if errorlevel 1 (
-    echo Existing .venv uses an unsupported Python version. Recreating .venv...
+    echo Existing .venv is not using Python 3. Recreating .venv...
     rmdir /s /q ".venv"
   )
 )
@@ -28,8 +28,8 @@ if exist ".venv\Scripts\python.exe" (
 if not exist ".venv\Scripts\python.exe" (
   call :find_python
   if not defined PY_CMD (
-    echo Python 3.11, 3.12, or 3.13 was not found.
-    echo Install Python 3.12 from https://www.python.org/downloads/windows/
+    echo Python 3 was not found.
+    echo Install Python 3 from https://www.python.org/downloads/windows/
     echo Then reopen this folder and run start.cmd again.
     pause
     exit /b 1
@@ -88,28 +88,27 @@ exit /b 0
 :find_python
 where py >nul 2>nul
 if not errorlevel 1 (
-  py -3.12 -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)" >nul 2>nul
+  py -3 -c "import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)" >nul 2>nul
   if not errorlevel 1 (
-    set "PY_CMD=py -3.12"
-    exit /b 0
-  )
-  py -3.11 -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)" >nul 2>nul
-  if not errorlevel 1 (
-    set "PY_CMD=py -3.11"
-    exit /b 0
-  )
-  py -3.13 -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)" >nul 2>nul
-  if not errorlevel 1 (
-    set "PY_CMD=py -3.13"
+    set "PY_CMD=py -3"
     exit /b 0
   )
 )
 
 where python >nul 2>nul
 if not errorlevel 1 (
-  python -c "import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) else 1)" >nul 2>nul
+  python -c "import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)" >nul 2>nul
   if not errorlevel 1 (
     set "PY_CMD=python"
+    exit /b 0
+  )
+)
+
+where python3 >nul 2>nul
+if not errorlevel 1 (
+  python3 -c "import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)" >nul 2>nul
+  if not errorlevel 1 (
+    set "PY_CMD=python3"
     exit /b 0
   )
 )
