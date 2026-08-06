@@ -10,7 +10,7 @@ from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from sqlalchemy import delete, func
+from sqlalchemy import and_, delete, func, or_
 from sqlmodel import Session, select
 
 from app.config import get_settings
@@ -39,6 +39,14 @@ BOUNCE_SUBJECT_RE = re.compile(
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-']+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
 FINAL_RECIPIENT_RE = re.compile(r"Final-Recipient:\s*rfc822;\s*([^\s<>;]+@[^\s<>;]+)", re.IGNORECASE)
 DIAGNOSTIC_RE = re.compile(r"Diagnostic-Code:\s*([^\n\r]+(?:[\n\r]+[ \t]+[^\n\r]+)*)", re.IGNORECASE)
+ENHANCED_STATUS_RE = re.compile(r"\b([45])\.\d\.\d\b")
+SMTP_STATUS_RE = re.compile(r"\b([45])\d{2}\b")
+HARD_BOUNCE_TEXT_RE = re.compile(
+    r"(permanent failure|recipient unknown|unknown recipient|user unknown|unknown user|"
+    r"no such (?:user|recipient|mailbox)|mailbox unavailable|does not exist|"
+    r"wasn't found|address rejected:\s*access denied|invalid (?:address|recipient|mailbox))",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -46,6 +54,7 @@ class BounceScanResult:
     scanned_messages: int = 0
     detected_bounces: int = 0
     suppressed_emails: int = 0
+    retry_eligible_bounces: int = 0
     errors: int = 0
 
 
@@ -116,6 +125,21 @@ def _extract_reason(body: str) -> str:
     return (lines[0] if lines else "Delivery failure detected.")[:500]
 
 
+def _is_hard_bounce(reason: str, body: str) -> bool:
+    haystack = f"{reason}\n{body[:5000]}"
+    enhanced_statuses = ENHANCED_STATUS_RE.findall(haystack)
+    if "5" in enhanced_statuses:
+        return True
+    if "4" in enhanced_statuses:
+        return False
+    smtp_statuses = SMTP_STATUS_RE.findall(haystack)
+    if "5" in smtp_statuses:
+        return True
+    if "4" in smtp_statuses:
+        return False
+    return bool(HARD_BOUNCE_TEXT_RE.search(haystack))
+
+
 def _imap_host_for_sender(sender: SenderAccount) -> tuple[str, int]:
     settings = get_settings()
     host = sender.smtp_host.lower().strip()
@@ -158,6 +182,24 @@ def _latest_send_for_recipient(session: Session, recipient: str, sender: SenderA
         )
         .order_by(SendRecord.sent_at.desc(), SendRecord.id.desc())
     ).first()
+
+
+def _previous_send_was_bounced(session: Session, recipient: str, current: SendRecord) -> bool:
+    if current.id is None:
+        return False
+    previous = session.exec(
+        select(SendRecord)
+        .where(
+            func.lower(SendRecord.recipient_email) == recipient.lower(),
+            SendRecord.id != current.id,
+            or_(
+                SendRecord.sent_at < current.sent_at,
+                and_(SendRecord.sent_at == current.sent_at, SendRecord.id < current.id),
+            ),
+        )
+        .order_by(SendRecord.sent_at.desc(), SendRecord.id.desc())
+    ).first()
+    return previous is not None and previous.smtp_status == "bounced"
 
 
 def _removed_email_for_contact(contact_id: int) -> str:
@@ -207,12 +249,17 @@ def cleanup_bounced_contacts(session: Session) -> dict[str, int]:
     ]
     for email in bounced_emails:
         normalized = email.strip().lower()
+        suppression = session.exec(
+            select(Suppression).where(func.lower(Suppression.email) == normalized)
+        ).first()
+        if suppression is None:
+            # First non-hard bounce remains retry-eligible. BounceRecord is audit
+            # evidence only until a hard bounce or consecutive second bounce.
+            continue
         contact = session.exec(select(Contact).where(func.lower(Contact.email) == normalized)).first()
         if contact is None:
             continue
         stats["emails_processed"] += 1
-        if session.exec(select(Suppression).where(Suppression.email == normalized)).first() is None:
-            session.add(Suppression(email=normalized, reason="bounce cleanup"))
 
         company = session.get(Company, contact.company_id)
         for record in session.exec(select(BounceRecord).where(func.lower(BounceRecord.recipient_email) == normalized)).all():
@@ -242,7 +289,7 @@ def _record_bounce(
     recipient: str,
     send_record: SendRecord,
     body: str,
-) -> bool:
+) -> str | None:
     existing = session.exec(
         select(BounceRecord).where(
             BounceRecord.sender_account_id == sender.id,
@@ -251,12 +298,24 @@ def _record_bounce(
         )
     ).first()
     if existing:
-        return False
+        return None
 
     now = utc_now()
     subject = _decode_header_value(message.get("Subject"))
     message_from = _decode_header_value(message.get("From"))
     reason = _extract_reason(body)
+    hard_bounce = _is_hard_bounce(reason, body)
+    consecutive_second_bounce = not hard_bounce and _previous_send_was_bounced(
+        session, recipient, send_record
+    )
+    should_suppress = hard_bounce or consecutive_second_bounce
+    decision = (
+        "hard_suppressed"
+        if hard_bounce
+        else "repeat_suppressed"
+        if consecutive_second_bounce
+        else "soft_retry"
+    )
     excerpt = re.sub(r"\s+", " ", body).strip()[:1200]
     session.add(
         BounceRecord(
@@ -278,22 +337,26 @@ def _record_bounce(
     send_record.smtp_status = "bounced"
     session.add(send_record)
 
-    contact = session.get(Contact, send_record.contact_id)
-    if contact:
-        contact.status = "bounced"
-        contact.updated_at = now
-        session.add(contact)
+    if should_suppress:
+        contact = session.get(Contact, send_record.contact_id)
+        if contact:
+            contact.status = "bounced"
+            contact.updated_at = now
+            session.add(contact)
 
-    company = session.get(Company, send_record.company_id)
-    if company and company.status not in {"replied", "unsubscribed", "blacklisted"}:
-        company.status = "bounced"
-        company.next_follow_up_at = None
-        company.updated_at = now
-        session.add(company)
+        company = session.get(Company, send_record.company_id)
+        if company and company.status not in {"replied", "unsubscribed", "blacklisted"}:
+            company.status = "bounced"
+            company.next_follow_up_at = None
+            company.updated_at = now
+            session.add(company)
 
-    existing_suppression = session.exec(select(Suppression).where(Suppression.email == recipient)).first()
-    if existing_suppression is None:
-        session.add(Suppression(email=recipient, reason=f"bounce: {reason[:180]}"))
+        existing_suppression = session.exec(
+            select(Suppression).where(func.lower(Suppression.email) == recipient.lower())
+        ).first()
+        if existing_suppression is None:
+            prefix = "hard bounce" if hard_bounce else "consecutive second bounce"
+            session.add(Suppression(email=recipient, reason=f"{prefix}: {reason[:160]}"))
 
     if send_record.draft_id:
         session.add(
@@ -307,12 +370,13 @@ def _record_bounce(
                         "mailbox_uid": uid,
                         "reason": reason,
                         "subject": subject,
+                        "decision": decision,
                     },
                     ensure_ascii=False,
                 ),
             )
         )
-    return True
+    return decision
 
 
 def scan_sender_bounces(session: Session, sender: SenderAccount, lookback_days: int | None = None) -> BounceScanResult:
@@ -358,10 +422,15 @@ def scan_sender_bounces(session: Session, sender: SenderAccount, lookback_days: 
                     send_record = _latest_send_for_recipient(session, recipient, sender)
                     if send_record is None:
                         continue
-                    if _record_bounce(session, sender, uid, message, recipient, send_record, body):
-                        result.suppressed_emails += 1
+                    decision = _record_bounce(session, sender, uid, message, recipient, send_record, body)
+                    if decision:
+                        if decision == "soft_retry":
+                            result.retry_eligible_bounces += 1
+                        else:
+                            result.suppressed_emails += 1
                         logger.info(
-                            "bounce suppressed sender=%s recipient=%s send_record_id=%s uid=%s reason=%s",
+                            "bounce decision=%s sender=%s recipient=%s send_record_id=%s uid=%s reason=%s",
+                            decision,
                             sender.email,
                             recipient,
                             send_record.id,
@@ -386,12 +455,14 @@ def scan_bounces(session: Session, sender_id: int | None = None) -> dict[str, in
         totals.scanned_messages += result.scanned_messages
         totals.detected_bounces += result.detected_bounces
         totals.suppressed_emails += result.suppressed_emails
+        totals.retry_eligible_bounces += result.retry_eligible_bounces
         totals.errors += result.errors
     cleanup = cleanup_bounced_contacts(session)
     return {
         "scanned_messages": totals.scanned_messages,
         "detected_bounces": totals.detected_bounces,
         "suppressed_emails": totals.suppressed_emails,
+        "retry_eligible_bounces": totals.retry_eligible_bounces,
         "errors": totals.errors,
         **cleanup,
     }

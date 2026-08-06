@@ -13,7 +13,7 @@
         <header class="topbar">
           <div>
             <h1>发件邮箱</h1>
-            <p>这里管理用于 SMTP 发送的邮箱、每日上限、发送时间窗口、发送间隔和打开追踪。保存窗口后，该邮箱现有待发送队列会重新排程；窗口按本机时间执行，支持 17:00-02:00 这类跨午夜窗口。</p>
+            <p>这里管理用于 SMTP 发送的邮箱、每日上限、发送时间窗口、发送间隔和打开追踪。每个发件邮箱可按目标市场时区配置多个窗口；保存后会重新排程该邮箱现有待发送队列。</p>
             <div class="version-line">
               <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
               <span>版本 {{ app_version }}</span>
@@ -45,13 +45,9 @@
                     <td><strong>{{ item.advice.recommended_daily_limit }}/天</strong><br><small>{{ item.advice.provider }}；警戒线 {{ item.advice.caution_daily_limit }}/天</small></td>
                     <td>
                       <small>SMTP：{{ item.sender.smtp_host }}:{{ item.sender.smtp_port }}</small><br>
-                      <small>窗口：{{ item.sender.window_start.strftime('%H:%M') }} - {{ item.sender.window_end.strftime('%H:%M') }}{% if item.sender.window_start > item.sender.window_end %}（跨午夜）{% endif %}</small><br>
+                      <small>时区：{{ item.send_timezone }}</small><br>
+                      <small>窗口：{{ item.send_windows }}</small><br>
                       {% if is_no_delay %}<small>发送间隔：不加额外延迟</small>{% elif is_fixed_delay %}<small>发送间隔：固定 {{ item.sender.random_delay_min_seconds }} 秒</small>{% else %}<small>发送间隔：随机 {{ item.sender.random_delay_min_seconds }}-{{ item.sender.random_delay_max_seconds }} 秒</small>{% endif %}
-                      <form action="/senders/{{ item.sender.id }}/window" method="post" class="inline-window-form">
-                        <input name="window_start" type="time" value="{{ item.sender.window_start.strftime('%H:%M') }}" aria-label="窗口开始" />
-                        <input name="window_end" type="time" value="{{ item.sender.window_end.strftime('%H:%M') }}" aria-label="窗口结束" />
-                        <button class="secondary" type="submit">保存窗口</button>
-                      </form>
                     </td>
                     <td>
                       <details class="sender-editor">
@@ -65,8 +61,8 @@
                           <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="{{ '已加密保存，留空则不修改' if item.sender.smtp_password_encrypted else '输入后加密保存' }}" /></label>
                           <label>密码环境变量（备用）<input name="password_env" value="{{ item.sender.password_env or '' }}" placeholder="SMTP_PASSWORD_PRIMARY" /></label>
                           <label>单日最大发送数<input name="daily_limit" type="number" min="1" max="10000" value="{{ item.sender.daily_limit }}" /></label>
-                          <label>发送窗口开始<input name="window_start" type="time" value="{{ item.sender.window_start.strftime('%H:%M') }}" /></label>
-                          <label>发送窗口结束<input name="window_end" type="time" value="{{ item.sender.window_end.strftime('%H:%M') }}" /></label>
+                          <label>目标市场时区<input name="send_timezone" value="{{ item.send_timezone }}" list="timezone-options" required /></label>
+                          <label>多个发送窗口<input name="send_windows" value="{{ item.send_windows }}" placeholder="09:30-11:30, 14:00-16:30" required /></label>
                           <label>发送间隔策略
                             <select name="interval_mode">
                               <option value="random" {% if not is_no_delay and not is_fixed_delay %}selected{% endif %}>随机间隔</option>
@@ -106,8 +102,8 @@
             <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="输入后加密保存" /></label>
             <label>密码环境变量（备用）<input name="password_env" placeholder="SMTP_PASSWORD_PRIMARY" /></label>
             <label>单日最大发送数<input name="daily_limit" type="number" value="{{ default_recommended_daily_limit }}" min="1" max="10000" /></label>
-            <label>发送窗口开始<input name="window_start" type="time" value="09:30" /></label>
-            <label>发送窗口结束<input name="window_end" type="time" value="17:30" /></label>
+            <label>目标市场时区<input name="send_timezone" value="Europe/London" list="timezone-options" required /></label>
+            <label>多个发送窗口<input name="send_windows" value="09:30-11:30, 14:00-16:30" placeholder="09:30-11:30, 14:00-16:30" required /></label>
             <label>发送间隔策略
               <select name="interval_mode">
                 <option value="random" selected>随机间隔</option>
@@ -122,6 +118,13 @@
             <button type="submit">保存邮箱</button>
           </form>
         </section>
+
+        <datalist id="timezone-options">
+          <option value="Europe/London"></option>
+          <option value="Europe/Paris"></option>
+          <option value="America/New_York"></option>
+          <option value="Asia/Shanghai"></option>
+        </datalist>
 
       </section>
     </main>

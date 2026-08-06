@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 from copy import deepcopy
 from html import escape
@@ -20,26 +20,26 @@ TEXT_SIGNATURE_END = "[[bd-signature:end]]"
 signature_env = Environment(undefined=StrictUndefined, autoescape=True)
 
 DEFAULT_SIGNATURE_CONFIG = {
-    "enabled": False,
+    "enabled": True,
     "sender_name": "Your Name",
     "title_prefix": "Regional Manager",
-    "company_name": "Example Company",
+    "company_name": "Your Company",
     "default_region": "UK",
-    "default_email": "your.name@example.com",
-    "default_phone": "",
-    "western_phone": "",
-    "southeast_asia_phone": "",
-    "address": "",
+    "default_email": "sender@example.com",
+    "default_phone": "+1 555 0100",
+    "western_phone": "+1 555 0100",
+    "southeast_asia_phone": "+1 555 0101",
+    "address": "Your company address",
     "country_rules": [
         {
             "countries": ["United Kingdom", "UK", "Great Britain", "England", "Scotland", "Wales", "Ireland"],
             "region": "UK & IE",
-            "phone": "",
+            "phone": "+1 555 0100",
         },
         {
             "countries": ["France"],
             "region": "FR",
-            "phone": "",
+            "phone": "+1 555 0100",
         },
         {
             "countries": [
@@ -56,7 +56,7 @@ DEFAULT_SIGNATURE_CONFIG = {
                 "Timor-Leste",
             ],
             "region": "Southeast Asia",
-            "phone": "",
+            "phone": "+1 555 0101",
         },
         {
             "countries": [
@@ -80,7 +80,7 @@ DEFAULT_SIGNATURE_CONFIG = {
                 "New Zealand",
             ],
             "region": "Western Region",
-            "phone": "",
+            "phone": "+1 555 0100",
         },
     ],
     "sender_rules": [],
@@ -112,24 +112,26 @@ def upsert_signature_template(
     body_text: str | None = None,
     name: str = DEFAULT_SIGNATURE_TEMPLATE_NAME,
 ) -> EmailTemplate:
-    template = get_signature_template(session)
-    if template is None:
-        template = session.exec(select(EmailTemplate).where(EmailTemplate.name == name.strip())).first()
-    if template is None:
-        template = EmailTemplate(
-            name=name.strip() or DEFAULT_SIGNATURE_TEMPLATE_NAME,
-            template_type=SIGNATURE_TEMPLATE_TYPE,
-            subject="Signature",
-            body_html=body_html,
-        )
-    template.name = name.strip() or DEFAULT_SIGNATURE_TEMPLATE_NAME
-    template.template_type = SIGNATURE_TEMPLATE_TYPE
-    template.subject = "Signature"
-    template.body_html = body_html
-    template.body_text = body_text
-    template.cc_enabled = False
-    template.cc_emails = None
-    template.is_active = True
+    current = get_signature_template(session)
+    template_name = name.strip() or DEFAULT_SIGNATURE_TEMPLATE_NAME
+    if (
+        current is not None
+        and current.name == template_name
+        and current.body_html == body_html
+        and (current.body_text or "") == (body_text or "")
+    ):
+        return current
+
+    template = EmailTemplate(
+        name=template_name,
+        template_type=SIGNATURE_TEMPLATE_TYPE,
+        subject="Signature",
+        body_html=body_html,
+        body_text=body_text,
+        cc_enabled=False,
+        cc_emails=None,
+        is_active=True,
+    )
     session.add(template)
     session.flush()
     old_templates = session.exec(
@@ -207,7 +209,7 @@ def signature_context(
         "sender_name": str(config.get("sender_name") or "Your Name"),
         "title_prefix": str(config.get("title_prefix") or "Regional Manager"),
         "region": str(config.get("default_region") or "UK"),
-        "company_name": str(config.get("company_name") or "Example Company"),
+        "company_name": str(config.get("company_name") or "Your Company"),
         "sender_email": sender.email if sender else str(config.get("default_email") or ""),
         "phone": str(config.get("default_phone") or ""),
         "address": str(config.get("address") or ""),
@@ -398,7 +400,6 @@ def parse_country_rules_text(value: str) -> list[dict]:
             }
         )
     return rules
-
 
 def parse_sender_rules_text(value: str) -> list[dict]:
     rules: list[dict] = []

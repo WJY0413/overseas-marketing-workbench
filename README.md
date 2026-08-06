@@ -1,78 +1,50 @@
-# BD Email Workbench Lite
+# 海外营销 Workbench
 
-This repository is a local-first workbench for preparing, reviewing, scheduling, sending, and auditing B2B email campaigns. It turns a loose spreadsheet or company database export into a controlled queue with draft approval, sender limits, follow-up rules, bounce suppression, and send records.
+海外营销 Workbench（Overseas Marketing Workbench）是一套可在 Windows 本地运行的 SMTP 营销邮件工作台。它把发信队列、发送节奏、记录、邮箱风险检查、退信抑制和 NO-GO 管理放在本机执行；安排完成后不需要 AI 会话持续运行。
 
-The public version starts in dry-run mode. It contains no customer database, mailbox password, send history, signature identity, production path, or private business note.
+## 能做什么
 
-## What works
+- 多邮箱轮发、单邮箱发送上限、随机间隔与指定时间窗口。
+- 富文本邮件模板、图片和个性化字段，如公司名、联系人和区域。
+- 发送前邮箱质量检查、退信处理、抑制名单和 NO-GO 区域管理。
+- 本地队列与发送记录，便于复盘触达周期，避免重复或过度营销。
+- 自带网页工作台，也可通过随包 Codex Skills 用对话完成检查和日常操作。
 
-- CSV/Excel and BD JSON contact import
-- reusable HTML/text templates and per-recipient draft generation
-- human approval before queueing
-- multiple SMTP sender accounts and per-sender daily limits
-- scheduled queue processing, pause/resume/cancel, and follow-up rules
-- optional open tracking, disabled by default
-- IMAP bounce scanning and suppression records
-- local SQLite storage and Excel sending reports
-- encrypted local SMTP password storage or environment-variable lookup
+## 第一次使用
 
-## Start on Windows
+1. 安装 Python 3.12；同时支持 3.11 和 3.13，本版不建议 Python 3.14。
+2. 解压后先阅读 `FIRST_START.md`，双击 `install_skills.cmd`。
+3. 重启 Codex，发送：`请使用 $workbench-first-run-check 检查并完成海外营销 Workbench 首次配置。`
+4. 未发现旧版本时双击 `start.cmd`；发现一个旧版本时按检查结果原地升级；发现多个版本时先指定唯一主版本。
+5. 在页面中配置至少一个可用 SMTP 邮箱，并保存、预览个性化签名。
 
-1. Install Python 3.11, 3.12, or 3.13.
-2. Clone this repository.
-3. Double-click `start.cmd`, or run:
+`start.cmd` 会创建 `.env`、`.venv` 和新的本地 SQLite 数据库，然后启动 `http://127.0.0.1:8001`。
 
-```powershell
-.\start.ps1
-```
+## 安全默认值
 
-The launcher creates `.venv`, installs dependencies, copies `.env.example` to `.env`, and opens <http://127.0.0.1:8000>.
+- `DRY_RUN_EMAIL=true`
+- `ENABLE_OPEN_TRACKING=false`
+- 不含真实 SMTP 密码、客户数据、发送记录、数据库、日志、备份或真实签名。
+- 实际发送前仍需检查发件人、收件人、模板、签名、抑制状态、NO-GO 和队列。
 
-## Start manually
+## 已有版本升级
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-For macOS/Linux, activate the virtual environment with `source .venv/bin/activate` and use the same `pip` and `uvicorn` commands.
-
-## Safe first run
-
-Keep these values until you have inspected every draft and sender setting:
-
-```env
-DRY_RUN_EMAIL=true
-ENABLE_OPEN_TRACKING=false
-```
-
-Dry-run messages are recorded as `simulated`; they are not sent over SMTP. Before changing to real sending, add your own mailbox, app password, signature, legal identity, and provider-specific daily limits.
-
-## Public package boundaries
-
-Included: application source, HTML templates, relative-path launchers, maintenance and validation scripts, an example environment file, and a Codex operator skill.
-
-Not included: `.env`, SQLite files, sender credentials, local encryption keys, contacts, customer data, send/reply/bounce history, production reports, backups, or internal campaign templates.
-
-See [`SCRIPT_INDEX.md`](SCRIPT_INDEX.md) for all packaged operating, validation, backup, and release scripts.
-
-## Daily Codex skill
-
-Clone or copy this whole repository into your Codex skills directory as `bd-email-workbench-lite`. The root `SKILL.md` makes the application and all maintenance scripts available to the daily operator skill. It keeps routine work in dry-run/review mode unless real sending is explicitly authorized.
-
-## Verification
+不要把新版作为第二套软件启动。先让 `$workbench-first-run-check` 确认唯一旧版本，再预览：
 
 ```powershell
-python -m compileall -q app scripts
-python scripts/smoke_test.py
+powershell -ExecutionPolicy Bypass -File .\scripts\update_existing_workbench.ps1 -TargetRoot "<existing-workbench-root>"
 ```
 
-## Known limits
+确认目标后增加 `-Apply`。脚本保留 `.env`、`.venv`、`data/`、数据库、邮箱凭据、签名、发送记录、报告和备份，并把被替换的程序文件备份到旧版本的 `code_backups/`。
 
-This is a practical single-user local application, not a hosted multi-tenant service. Real sending depends on your SMTP/IMAP provider and your compliance obligations. The app does not create consent or make a campaign lawful by itself.
+## 随包 Skills
+
+压缩包包含 7 个 Workbench Skills：首次启动检查、每日路由、邮件发送、收件箱检查、退信抑制、队列构建和参数调整。安装器只更新同名目录并先备份；检测到 `copy`、`old`、`(1)` 等重复目录时会停止。
+
+## 公开版本边界
+
+仓库只包含程序、虚构示例数据、模板和使用说明。真实 SMTP 凭据、客户名单、数据库、发送记录、日志、备份和真实签名均未包含。SMTP 服务商的限额、反垃圾策略和最终投递结果仍由对应服务商决定；建议先保持 `DRY_RUN_EMAIL=true` 完成预览和测试。
 
 ## License
 
-MIT. See `LICENSE`.
+本项目采用 [MIT License](LICENSE)。

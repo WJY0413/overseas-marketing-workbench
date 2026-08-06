@@ -21,8 +21,60 @@
 
         <section class="panel">
           <div class="panel-head">
+            <div>
+              <h2>NO-GO 公司</h2>
+              <small>整家公司禁止发送及自动跟进；公司和联系人历史记录保留。</small>
+            </div>
+            <span class="badge danger">{{ no_go_company_rows|length }} 家</span>
+          </div>
+          <form action="/crm/no-go/import" method="post" enctype="multipart/form-data" class="form-grid">
+            <label>
+              上传名单
+              <input name="file" type="file" accept=".xlsx,.xlsm,.csv,.txt" required />
+              <small>支持 Excel、CSV、TXT；优先识别 company、company name、公司名称列，否则读取第一列。</small>
+            </label>
+            <button type="submit">导入并设为 NO-GO</button>
+          </form>
+
+          <label>
+            搜索 NO-GO 公司
+            <input id="no-go-company-search" type="search" placeholder="输入公司名、国家或来源" />
+          </label>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>公司</th>
+                  <th>国家</th>
+                  <th>类型</th>
+                  <th>联系人</th>
+                  <th>来源</th>
+                  <th>更新时间</th>
+                </tr>
+              </thead>
+              <tbody id="no-go-company-list">
+                {% for row in no_go_company_rows %}
+                  {% set company = row.company %}
+                  <tr data-no-go-company="{{ (company.name ~ ' ' ~ (company.country or '') ~ ' ' ~ (company.source or ''))|lower }}">
+                    <td><strong>{{ company.name }}</strong></td>
+                    <td>{{ company.country or "-" }}</td>
+                    <td>{{ company.company_type or "-" }}</td>
+                    <td>{{ row.contact_count }}</td>
+                    <td>{{ company.source or "-" }}</td>
+                    <td>{{ display_dt(company.updated_at) }}</td>
+                  </tr>
+                {% else %}
+                  <tr><td colspan="6">暂无 NO-GO 公司。</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
             <h2>公司视图</h2>
-            <small>{{ company_rows|length }} 家公司 · {{ contacts|length }} 个联系人</small>
+            <small>{{ company_rows|length }} 家公司 · {{ crm_contact_count }} 个联系人</small>
           </div>
           <div class="crm-company-list">
             <div class="crm-table-head crm-company-head">
@@ -174,5 +226,18 @@
         </section>
       </section>
     </main>
+    <script>
+      (() => {
+        const search = document.getElementById("no-go-company-search");
+        const rows = document.querySelectorAll("#no-go-company-list tr[data-no-go-company]");
+        if (!search) return;
+        search.addEventListener("input", () => {
+          const query = search.value.trim().toLocaleLowerCase();
+          rows.forEach((row) => {
+            row.hidden = query && !row.dataset.noGoCompany.includes(query);
+          });
+        });
+      })();
+    </script>
   </body>
 </html>

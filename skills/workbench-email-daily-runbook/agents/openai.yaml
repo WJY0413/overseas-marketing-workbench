@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench Email Daily Runbook"
+  short_description: "Run the operator daily Workbench email sending workflows"
+  default_prompt: "Use $workbench-email-daily-runbook to inspect or operate this Workbench email workflow safely."

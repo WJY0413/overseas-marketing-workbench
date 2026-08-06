@@ -12,6 +12,7 @@ from sqlmodel import Session
 
 from app.config import get_settings
 from app.models import Contact, EmailDraft, SenderAccount
+from app.services.render_validation import validate_rendered_message
 from app.services.secrets import decrypt_secret
 
 
@@ -141,6 +142,13 @@ def send_draft(session: Session, draft: EmailDraft, sender: SenderAccount) -> st
     contact = session.get(Contact, draft.contact_id)
     if contact is None:
         raise RuntimeError("Contact not found.")
+    validate_rendered_message(
+        subject=draft.subject,
+        body_html=draft.body_html,
+        body_text=draft.body_text,
+        recipient_email=contact.email,
+        cc_emails=draft.cc_emails,
+    )
 
     html = draft.body_html
     if get_settings().enable_open_tracking and sender.enable_open_tracking:
