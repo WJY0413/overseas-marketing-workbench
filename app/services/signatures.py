@@ -401,6 +401,7 @@ def parse_country_rules_text(value: str) -> list[dict]:
         )
     return rules
 
+
 def parse_sender_rules_text(value: str) -> list[dict]:
     rules: list[dict] = []
     for line in (value or "").splitlines():
@@ -420,3 +421,4 @@ def parse_sender_rules_text(value: str) -> list[dict]:
             }
         )
     return rules
+

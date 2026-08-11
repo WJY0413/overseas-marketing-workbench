@@ -1,6 +1,6 @@
 ---
 name: workbench-inbox-check
-description: Check Overseas Marketing Workbench sender inboxes for replies, bounce clues, customer responses, or delivery notices. Use when the operator asks to inspect inbox, check whether someone replied, search sender mailbox, verify bounce or delivery messages, or manually ingest reply evidence. This skill is read-only by default and does not send email or build queues.
+description: Check BD Email Workbench sender inboxes for replies, bounce clues, customer responses, or delivery notices. Use when the operator asks to inspect inbox, check whether someone replied, search sender mailbox, verify bounce or delivery messages, or manually ingest reply evidence. This skill is read-only by default and does not send email or build queues.
 ---
 
 # Workbench Inbox Check

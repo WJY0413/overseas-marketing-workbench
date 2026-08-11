@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from app.models import (
     Suppression,
 )
 from app.time_utils import utc_now
+from app.services.suppression import is_active_suppression
 
 
 SOURCE_SYSTEM = "BDdb"
@@ -181,13 +183,121 @@ def _prepare_source(data: dict[str, Any]) -> tuple[list[dict[str, Any]], int, li
     return prepared, len(companies), rejects
 
 
+def _json_object(value: object, *, label: str) -> dict[str, Any]:
+    try:
+        data = json.loads(_text(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"BD source SQLite contains invalid {label} raw_json: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"BD source SQLite {label} raw_json must be an object.")
+    return data
+
+
+def _sqlite_source_data(source_path: Path) -> tuple[dict[str, Any], str, int]:
+    uri = f"file:{source_path.resolve().as_posix()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        raise OSError(f"BD source SQLite database is not readable: {source_path}: {exc}") from exc
+
+    company_columns = {
+        "company_id", "domain", "standard_company_name", "website", "country", "rating",
+        "company_type", "source", "status", "is_blacklisted", "primary_business_region", "raw_json",
+    }
+    contact_columns = {
+        "company_id", "row_index", "contact_name", "contact_position", "contact_route",
+        "email_send_status", "priority_roll_status", "priority_contact_rank", "raw_json",
+    }
+    try:
+        available_companies = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
+        available_contacts = {row[1] for row in connection.execute("PRAGMA table_info(contacts)")}
+        missing = sorted(company_columns - available_companies)
+        missing += [f"contacts.{name}" for name in sorted(contact_columns - available_contacts)]
+        if missing:
+            raise ValueError(f"BD source SQLite schema is missing columns: {', '.join(missing)}")
+
+        digest = hashlib.sha256()
+        companies: dict[str, dict[str, Any]] = {}
+        by_external_id: dict[str, dict[str, Any]] = {}
+        company_rows = connection.execute(
+            """
+            SELECT company_id, domain, standard_company_name, website, country, rating,
+                   company_type, source, status, is_blacklisted, primary_business_region, raw_json
+              FROM companies
+             ORDER BY company_id
+            """
+        )
+        for ordinal, row in enumerate(company_rows):
+            digest.update("\x1f".join(_text(row[column]) for column in row.keys()).encode("utf-8"))
+            digest.update(b"\n")
+            company_id = _text(row["company_id"])
+            company = _json_object(row["raw_json"], label=f"company {company_id or ordinal}")
+            # Explicit normalized columns are authoritative; do not inherit stale nested contacts.
+            company.update(
+                {
+                    "company_id": company_id,
+                    "domain": _text(row["domain"]),
+                    "standard_company_name": _text(row["standard_company_name"]),
+                    "website": _text(row["website"]),
+                    "country": _text(row["country"]),
+                    "rating": _text(row["rating"]),
+                    "company_type": _text(row["company_type"]),
+                    "source": _text(row["source"]),
+                    "status": _text(row["status"]),
+                    "primary_business_region": _text(row["primary_business_region"]),
+                    "blacklist": {"is_blacklisted": bool(row["is_blacklisted"])},
+                    "contact_rows": [],
+                }
+            )
+            companies[f"{company_id}\x1f{ordinal}"] = company
+            by_external_id[company_id] = company
+
+        contact_rows = connection.execute(
+            """
+            SELECT company_id, row_index, contact_name, contact_position, contact_route,
+                   email_send_status, priority_roll_status, priority_contact_rank, raw_json
+              FROM contacts
+             ORDER BY company_id, row_index
+            """
+        )
+        for row in contact_rows:
+            digest.update("\x1f".join(_text(row[column]) for column in row.keys()).encode("utf-8"))
+            digest.update(b"\n")
+            company_id = _text(row["company_id"])
+            company = by_external_id.get(company_id)
+            if company is None:
+                raise ValueError(f"BD source SQLite contact references unknown company_id: {company_id}")
+            contact = _json_object(row["raw_json"], label=f"contact {company_id}/{row['row_index']}")
+            # These aliases preserve the established Workbench sync contract.
+            contact.update(
+                {
+                    "联系人": _text(row["contact_name"]) or _text(contact.get("联系人")),
+                    "联系人职位": _text(row["contact_position"]) or _text(contact.get("联系人职位")),
+                    "联系方式": _text(row["contact_route"]) or _text(contact.get("联系方式")),
+                    "email_send_status": _text(row["email_send_status"]),
+                    "priority_roll_status": _text(row["priority_roll_status"]),
+                    "priority_contact_rank": _text(row["priority_contact_rank"]),
+                }
+            )
+            company["contact_rows"].append(contact)
+    except sqlite3.Error as exc:
+        raise ValueError(f"Unable to read BD source SQLite database: {exc}") from exc
+    finally:
+        connection.close()
+
+    return {"schema": "bddb-sqlite-v1", "companies": companies}, digest.hexdigest(), source_path.stat().st_mtime_ns
+
+
 def _load_source(source_path: Path | None) -> tuple[dict[str, Any], str, int]:
     if source_path is None:
-        raise ValueError("BD_DATABASE_JSON_PATH is not configured.")
+        raise ValueError("BD_DATABASE_SQLITE_PATH is not configured.")
     if not source_path.exists():
         raise FileNotFoundError(f"BD source path does not exist: {source_path}")
     if not source_path.is_file():
         raise ValueError(f"BD source path is not a file: {source_path}")
+    if source_path.suffix.casefold() in {".sqlite", ".db", ".sqlite3"}:
+        return _sqlite_source_data(source_path)
     try:
         payload = source_path.read_bytes()
     except OSError as exc:
@@ -195,7 +305,7 @@ def _load_source(source_path: Path | None) -> tuple[dict[str, Any], str, int]:
     try:
         data = json.loads(payload.decode("utf-8-sig"))
     except Exception as exc:
-        raise ValueError(f"Unable to parse BD source JSON: {exc}") from exc
+        raise ValueError(f"Unable to parse legacy BD source JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError("BD source JSON root must be an object.")
     return data, hashlib.sha256(payload).hexdigest(), source_path.stat().st_mtime_ns
@@ -319,9 +429,9 @@ def _sync_prepared(
     contacts = list(session.exec(select(Contact)))
     contacts_by_email = {_text(contact.email).casefold(): contact for contact in contacts}
     suppressed = {
-        _text(email).casefold()
-        for email in session.exec(select(Suppression.email))
-        if _text(email)
+        _text(item.email).casefold()
+        for item in session.exec(select(Suppression))
+        if _text(item.email) and is_active_suppression(item)
     }
     bounced = {
         _text(email).casefold()
@@ -379,14 +489,10 @@ def _sync_prepared(
                 )
                 continue
         else:
-            bootstrap_emails = sorted(
-                email
-                for email in source["all_emails"] - blocked_emails
-                if email in contacts_by_email
-            )
             owner_company_ids = {
                 contacts_by_email[email].company_id
-                for email in bootstrap_emails
+                for email in source["all_emails"] - blocked_emails
+                if email in contacts_by_email
             }
             if len(owner_company_ids) > 1:
                 _conflict(
@@ -395,11 +501,10 @@ def _sync_prepared(
                     external_company_id=external_id,
                     domain=source["domain"],
                     company_ids=sorted(owner_company_ids),
-                    quarantine_emails=bootstrap_emails,
                 )
                 blocked_ids.add(external_id)
                 quarantine_company_ids.add(external_id)
-                quarantine_emails.update(bootstrap_emails)
+                quarantine_emails.update(source["all_emails"] & set(contacts_by_email))
                 continue
             if len(owner_company_ids) == 1:
                 owner_id = next(iter(owner_company_ids))
@@ -410,14 +515,12 @@ def _sync_prepared(
                         "workbench_company_link_conflict",
                         external_company_id=external_id,
                         domain=source["domain"],
-                        email=bootstrap_emails[0] if len(bootstrap_emails) == 1 else None,
                         company_id=owner_id,
                         linked_external_company_id=existing_owner_link.external_company_id,
-                        quarantine_emails=bootstrap_emails,
                     )
                     blocked_ids.add(external_id)
                     quarantine_company_ids.add(external_id)
-                    quarantine_emails.update(bootstrap_emails)
+                    quarantine_emails.update(source["all_emails"] & set(contacts_by_email))
                     continue
                 company = companies_by_id.get(owner_id)
                 match_method = "email_overlap"

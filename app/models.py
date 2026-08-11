@@ -178,6 +178,7 @@ class Suppression(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str = Field(index=True, unique=True)
     reason: str = "blacklist"
+    expires_at: datetime | None = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=utc_now)
 
 

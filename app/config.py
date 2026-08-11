@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     default_imap_port: int = 993
     dry_run_email: bool = True
     default_sender_name: str = "Your Name"
+    # The operational BDdb read model is SQLite. JSON remains an explicit
+    # compatibility input for archived/legacy exports only.
+    bd_database_sqlite_path: str | None = None
     bd_database_json_path: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -40,17 +43,14 @@ class Settings(BaseSettings):
 
     @property
     def bd_database_path(self) -> Path | None:
+        if self.bd_database_sqlite_path:
+            return Path(self.bd_database_sqlite_path).expanduser()
         if self.bd_database_json_path:
             return Path(self.bd_database_json_path).expanduser()
-        discovered = (
-            Path.home()
-            / "Documents"
-            / "Overseas Marketing Workbench"
-            / "bd_company_database"
-            / "database"
-            / "bd_company_database.json"
-        )
-        return discovered if discovered.is_file() else None
+        # Shared packages do not discover a machine-specific master path.
+        # Configure BD_DATABASE_SQLITE_PATH explicitly when an external master
+        # sync is required; otherwise the Workbench operates on its local DB.
+        return None
 
 
 @lru_cache

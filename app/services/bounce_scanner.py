@@ -28,6 +28,7 @@ from app.models import (
 )
 from app.services.mailer import _read_env_value
 from app.services.secrets import decrypt_secret
+from app.services.suppression import is_active_suppression
 from app.time_utils import utc_now
 
 REMOVED_EMAIL_DOMAIN = "invalid.invalid"
@@ -357,6 +358,11 @@ def _record_bounce(
         if existing_suppression is None:
             prefix = "hard bounce" if hard_bounce else "consecutive second bounce"
             session.add(Suppression(email=recipient, reason=f"{prefix}: {reason[:160]}"))
+        elif not is_active_suppression(existing_suppression):
+            prefix = "hard bounce" if hard_bounce else "consecutive second bounce"
+            existing_suppression.reason = f"{prefix}: {reason[:160]}"
+            existing_suppression.expires_at = None
+            session.add(existing_suppression)
 
     if send_record.draft_id:
         session.add(

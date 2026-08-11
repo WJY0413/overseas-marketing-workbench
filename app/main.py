@@ -29,6 +29,8 @@ from app.services.no_go_companies import (
 from app.services.email_quality import validate_contact_email
 from app.services.app_settings import is_queue_paused, set_app_setting
 from app.services.bd_master_sync import get_bd_master_sync_status, run_bd_master_sync
+from app.services.followup_cadence import generate_dual_counter_followups, get_followup_cadence, save_followup_cadence
+from app.services.suppression import is_active_suppression
 from app.services.queue import (
     audit_draft,
     apply_audit_result,
@@ -78,7 +80,7 @@ from app.services.templates import render_template
 from app.time_utils import display_dt, local_now, utc_now
 from app.version import APP_VERSION
 
-app = FastAPI(title="海外营销 Workbench")
+app = FastAPI(title="BD Email Workbench Lite")
 logger = logging.getLogger(__name__)
 templates = Jinja2Templates(directory="app/templates")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
@@ -96,7 +98,7 @@ templates.env.globals["attachment_paths_text"] = attachment_paths_text
 
 def _clear_startup_workspace(session: Session) -> None:
     session.exec(delete(DraftPrepItem))
-    # EmailDraft is durable review/queue evidence. A Workbench restart must
+    # EmailDraft is durable review/queue evidence.  A Workbench restart must
     # never erase a prepared batch before the native handoff can process it.
 
 
@@ -616,6 +618,7 @@ def _crm_candidate_contacts(
     suppressions = {
         suppression.email
         for suppression in session.exec(select(Suppression)).all()
+        if is_active_suppression(suppression)
     }
     before_dt = _parse_filter_date(last_before, end_of_day=True)
     after_dt = _parse_filter_date(last_after)
@@ -1198,6 +1201,7 @@ def rules_page(request: Request, message: str = "", session: Session = Depends(g
             "app_version": APP_VERSION,
             "message": message,
             "rules": rules,
+            "cadence": get_followup_cadence(session),
             "templates": email_templates,
             "stats": _dashboard_stats(session),
         },
@@ -2162,6 +2166,28 @@ def scan_followups_now(session: Session = Depends(get_session)):
     return _redirect(f"Follow-up scan created {result['followup_drafts']} pending-review draft(s).")
 
 
+@app.post("/followups/generate-batch")
+def generate_followup_batch(
+    template_id: int = Form(...),
+    limit: int = Form(250),
+    priorities: str = Form("A,B,C"),
+    session: Session = Depends(get_session),
+):
+    try:
+        result = generate_dual_counter_followups(
+            session,
+            template_id=template_id,
+            priorities=priorities,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return _redirect_to("/rules", str(exc))
+    return _redirect_to(
+        "/rules",
+        f"双计数器手动批次已生成 {result['followup_drafts']} / {limit} 封待审核草稿；未启用自动跟进，未发送邮件。",
+    )
+
+
 @app.post("/followup-rules")
 def create_followup_rule(
     name: str = Form(...),
@@ -2170,14 +2196,31 @@ def create_followup_rule(
     priorities: str = Form("A,B,C"),
     session: Session = Depends(get_session),
 ):
-    template = session.get(EmailTemplate, template_id)
-    if template is None:
-        return _redirect("Follow-up template not found.")
-    if is_signature_template(template):
-        return _redirect("Signature templates cannot be used for follow-up rules.")
-    session.add(FollowUpRule(name=name, delay_days=delay_days, template_id=template_id, priorities=priorities))
-    session.commit()
-    return _redirect("Follow-up rule saved.")
+    return _redirect_to("/rules", "旧版固定延迟规则已停用；请使用双计数器跟进规则。")
+
+
+@app.post("/followup-cadence")
+def update_followup_cadence(
+    enabled: bool = Form(False),
+    template_id: int | None = Form(None),
+    priorities: str = Form("A,B,C"),
+    session: Session = Depends(get_session),
+):
+    try:
+        cadence = save_followup_cadence(
+            session,
+            enabled=enabled,
+            template_id=template_id,
+            priorities=priorities,
+        )
+    except ValueError as exc:
+        return _redirect_to("/rules", str(exc))
+    state = "已启用" if cadence.enabled else "已保存为停用"
+    return _redirect_to(
+        "/rules",
+        f"双计数器跟进规则{state}：同一联系人每次成功发送后增加 {cadence.contact_step_hours}h；"
+        f"更换联系人时，公司级最短间隔 {cadence.company_switch_min_hours}h。",
+    )
 
 
 @app.post("/suppressions")
@@ -2222,3 +2265,4 @@ def bd_database_sync_status(session: Session = Depends(get_session)):
     status = get_bd_master_sync_status(session, get_settings().bd_database_path)
     status["scheduler_running"] = scheduler.running
     return status
+
