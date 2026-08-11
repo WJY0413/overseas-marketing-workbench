@@ -1,4 +1,4 @@
 interface:
   display_name: "Workbench Parameter Tuner"
-  short_description: "Adjust common Overseas Marketing Workbench parameters"
-  default_prompt: "Use $workbench-parameter-tuner to inspect or update common Overseas Marketing Workbench parameters."
+  short_description: "Adjust common BD Email Workbench sender and queue parameters"
+  default_prompt: "Use $workbench-parameter-tuner to inspect or update common BD Email Workbench parameters."

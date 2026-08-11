@@ -1,7 +1,5 @@
 from collections.abc import Generator
-import logging
 from pathlib import Path
-import sqlite3
 
 from sqlalchemy import Engine, inspect, text
 from sqlmodel import Session, SQLModel, create_engine
@@ -15,23 +13,17 @@ settings.reports_dir.mkdir(parents=True, exist_ok=True)
 connect_args = {"check_same_thread": False} if settings.resolved_database_url.startswith("sqlite") else {}
 engine = create_engine(settings.resolved_database_url, connect_args=connect_args, pool_pre_ping=True)
 
-logger = logging.getLogger(__name__)
-COMPACT_STORAGE_VERSION_KEY = "compact_template_storage_version"
-COMPACT_STORAGE_VERSION = "2"
-COMPACT_STORAGE_PENDING_VACUUM = "2-pending-vacuum"
-ACTIVE_DRAFT_STATUSES = ("pending_review", "approved", "queued")
-
 
 def create_db_and_tables(
     target_engine: Engine | None = None,
     *,
     run_storage_migrations: bool = True,
 ) -> None:
+    # run_storage_migrations is accepted for the standalone sync auditor. The
+    # production 0.4.17 branch has no compact-storage migration to run.
     bind = target_engine or engine
     SQLModel.metadata.create_all(bind)
     _migrate_sqlite_columns(bind)
-    if run_storage_migrations:
-        _migrate_compact_template_storage(bind)
 
 
 def _migrate_sqlite_columns(target_engine: Engine) -> None:
@@ -105,6 +97,13 @@ def _migrate_sqlite_columns(target_engine: Engine) -> None:
             indexes = {index["name"] for index in inspector.get_indexes("contactroute")}
             if "ix_contactroute_contact_type" not in indexes:
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_contactroute_contact_type ON contactroute (contact_id, route_type)"))
+        if "suppression" in tables:
+            columns = {column["name"] for column in inspector.get_columns("suppression")}
+            indexes = {index["name"] for index in inspector.get_indexes("suppression")}
+            if "expires_at" not in columns:
+                conn.execute(text("ALTER TABLE suppression ADD COLUMN expires_at DATETIME"))
+            if "ix_suppression_expires_at" not in indexes:
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_suppression_expires_at ON suppression (expires_at)"))
         if "bdmastersyncrun" in tables:
             columns = {column["name"] for column in inspector.get_columns("bdmastersyncrun")}
             if "quarantine_company_count" not in columns:
@@ -113,148 +112,6 @@ def _migrate_sqlite_columns(target_engine: Engine) -> None:
                 conn.execute(text("ALTER TABLE bdmastersyncrun ADD COLUMN quarantine_email_count INTEGER DEFAULT 0 NOT NULL"))
             if "fatal_conflict_count" not in columns:
                 conn.execute(text("ALTER TABLE bdmastersyncrun ADD COLUMN fatal_conflict_count INTEGER DEFAULT 0 NOT NULL"))
-
-
-def _set_compact_storage_version(connection: sqlite3.Connection, value: str) -> None:
-    connection.execute(
-        """
-        INSERT INTO appsetting ("key", "value", updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT("key") DO UPDATE
-        SET "value" = excluded."value", updated_at = CURRENT_TIMESTAMP
-        """,
-        (COMPACT_STORAGE_VERSION_KEY, value),
-    )
-
-
-def _migrate_compact_template_storage(target_engine: Engine) -> None:
-    if target_engine.url.get_backend_name() != "sqlite":
-        return
-    database_value = target_engine.url.database
-    if not database_value or database_value == ":memory:":
-        return
-    database_path = Path(database_value)
-    if not database_path.exists():
-        return
-
-    connection = sqlite3.connect(database_path, timeout=30)
-    connection.execute("PRAGMA busy_timeout = 30000")
-    try:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        required_tables = {"appsetting", "emaildraft", "sendrecord"}
-        if not required_tables.issubset(tables):
-            return
-        marker_row = connection.execute(
-            'SELECT "value" FROM appsetting WHERE "key" = ?',
-            (COMPACT_STORAGE_VERSION_KEY,),
-        ).fetchone()
-        marker = marker_row[0] if marker_row else None
-        if marker == COMPACT_STORAGE_VERSION:
-            return
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            logger.error(
-                "Skipped compact storage migration because SQLite integrity_check returned %s.",
-                integrity,
-            )
-            return
-
-        rows_cleared = 0
-        if marker != COMPACT_STORAGE_PENDING_VACUUM:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute(
-                    """
-                    UPDATE sendrecord
-                    SET template_id = (
-                        SELECT emaildraft.template_id
-                        FROM emaildraft
-                        WHERE emaildraft.id = sendrecord.draft_id
-                    )
-                    WHERE template_id IS NULL
-                    """
-                )
-                connection.execute(
-                    """
-                    UPDATE sendrecord
-                    SET signature_template_id = (
-                        SELECT emaildraft.signature_template_id
-                        FROM emaildraft
-                        WHERE emaildraft.id = sendrecord.draft_id
-                    )
-                    WHERE signature_template_id IS NULL
-                    """
-                )
-                rows_cleared += connection.execute(
-                    """
-                    UPDATE sendrecord
-                    SET body_html = '', body_text = NULL
-                    WHERE LENGTH(COALESCE(body_html, '')) > 0
-                       OR LENGTH(COALESCE(body_text, '')) > 0
-                    """
-                ).rowcount
-                placeholders = ",".join("?" for _ in ACTIVE_DRAFT_STATUSES)
-                rows_cleared += connection.execute(
-                    f"""
-                    UPDATE emaildraft
-                    SET body_html = '', body_text = NULL, template_snapshot = NULL
-                    WHERE status NOT IN ({placeholders})
-                      AND (
-                            LENGTH(COALESCE(body_html, '')) > 0
-                         OR LENGTH(COALESCE(body_text, '')) > 0
-                         OR LENGTH(COALESCE(template_snapshot, '')) > 0
-                      )
-                    """,
-                    ACTIVE_DRAFT_STATUSES,
-                ).rowcount
-                rows_cleared += connection.execute(
-                    f"""
-                    UPDATE emaildraft
-                    SET template_snapshot = NULL
-                    WHERE status IN ({placeholders})
-                      AND LENGTH(COALESCE(template_snapshot, '')) > 0
-                    """,
-                    ACTIVE_DRAFT_STATUSES,
-                ).rowcount
-                _set_compact_storage_version(
-                    connection,
-                    COMPACT_STORAGE_PENDING_VACUUM
-                    if rows_cleared
-                    else COMPACT_STORAGE_VERSION,
-                )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-
-        if marker == COMPACT_STORAGE_PENDING_VACUUM or rows_cleared:
-            try:
-                connection.execute("VACUUM")
-                connection.execute("PRAGMA optimize")
-                post_integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-                if post_integrity != "ok":
-                    raise RuntimeError(
-                        f"post-migration integrity_check failed: {post_integrity}"
-                    )
-                _set_compact_storage_version(connection, COMPACT_STORAGE_VERSION)
-                connection.commit()
-                logger.info(
-                    "Compact storage migration completed for %s; rows cleared: %s.",
-                    database_path,
-                    rows_cleared,
-                )
-            except (RuntimeError, sqlite3.DatabaseError):
-                logger.exception(
-                    "Compact storage cleanup was applied, but VACUUM could not finish. "
-                    "The app will retry VACUUM on the next startup."
-                )
-    finally:
-        connection.close()
 
 
 def get_session() -> Generator[Session, None, None]:

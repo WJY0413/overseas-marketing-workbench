@@ -19,6 +19,25 @@
         </header>
         {% if message %}<div class="notice">{{ message }}</div>{% endif %}
         <section class="panel">
+          <h2>双计数器无回复跟进</h2>
+          <p>按 <code>sendrecord</code> 的成功发送历史计算。对同一联系人：第 1 封不限，第 2 封间隔 {{ cadence.contact_step_hours }}h，第 3 封间隔 {{ cadence.contact_step_hours * 2 }}h，之后每次多加 {{ cadence.contact_step_hours }}h。更换联系人时，同时要求距该公司最近一次成功发送至少 {{ cadence.company_switch_min_hours }}h。只生成待审核草稿，不自动发信；回复、退订、暂停或 NO-GO 会停止跟进。</p>
+          <form action="/followup-cadence" method="post" class="form-grid">
+            <label><input name="enabled" type="checkbox" value="true" {% if cadence.enabled %}checked{% endif %} /> 启用双计数器节奏</label>
+            <label>跟进模板
+              <select name="template_id" {% if cadence.enabled %}required{% endif %}>
+                <option value="">请选择已启用模板</option>
+                {% for template in templates if template.is_active and template.template_type == 'follow_up' %}
+                  <option value="{{ template.id }}" {% if template.id == cadence.template_id %}selected{% endif %}>{{ template.name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>适用等级<input name="priorities" value="{{ cadence.priorities | join(',') }}" required /></label>
+            <button type="submit">保存双计数器节奏</button>
+          </form>
+        </section>
+        <section class="panel">
+          <h2>旧版固定延迟规则</h2>
+          <p>已退役且不会再运行；保留以下历史记录仅供审计。新建或编辑必须使用双计数器规则。</p>
           <div class="table-wrap">
             <table>
               <thead><tr><th>规则</th><th>未回复天数</th><th>模板</th><th>客户等级</th></tr></thead>
@@ -29,19 +48,6 @@
               </tbody>
             </table>
           </div>
-          <form action="/followup-rules" method="post" class="form-grid">
-            <label>规则名<input name="name" value="No reply after 5 days" /></label>
-            <label>未回复几天后<input name="delay_days" type="number" value="5" /></label>
-            <label>跟进模板
-              <select name="template_id">
-                {% for template in templates %}
-                  <option value="{{ template.id }}">{{ template.name }}</option>
-                {% endfor %}
-              </select>
-            </label>
-            <label>适用等级<input name="priorities" value="A,B,C" /></label>
-            <button type="submit">保存规则</button>
-          </form>
         </section>
       </section>
     </main>

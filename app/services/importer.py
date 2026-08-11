@@ -576,6 +576,7 @@ def _import_normalized_rows(
     session.commit()
     return report
 
+
 def _row_values(
     ws,
     merged_lookup: dict[tuple[int, int], object],
@@ -737,3 +738,4 @@ def import_bd_json_candidates(session: Session, payload: bytes, filename: str = 
     report["source_system"] = _json_text(data.get("source_system"))
     report["selection_rule"] = _json_text(data.get("selection_rule"))
     return report
+

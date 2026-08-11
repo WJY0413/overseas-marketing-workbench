@@ -1,10 +1,9 @@
-﻿Package: Overseas_Marketing_Workbench_v0.4.20_Production_Clean
+﻿Package: Overseas_Marketing_Workbench_v0.4.22_Production_Clean
 Mode: Clean Share
-Created: 2026-08-06
+Created: 2026-08-11T14:11:49
 Includes .env: False
 Includes local data: False
 Includes saved secret key: False
 Includes bundled Workbench Skills: 7
-License: MIT
 
 Clean share excludes local data, reports, virtualenv, backups, internal maintenance docs, and secrets.

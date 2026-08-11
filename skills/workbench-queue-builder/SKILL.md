@@ -1,6 +1,6 @@
 ---
 name: workbench-queue-builder
-description: Hand confirmed batch email campaigns to the operator's production Overseas Marketing Workbench and ensure its existing queue is resumed. Use when the operator says this batch, today arrange sending, batch queue, regional outreach, or delayed campaign sending. This skill preserves one company per selected email, submits the batch through Workbench, starts the existing Workbench app in the background only when needed, and verifies appsetting.queue_paused=false. It must not implement its own risk checks, SMTP loop, scheduler, worker, or send completion logic. Use workbench-send-mail instead for one reviewed email.
+description: Hand confirmed batch email campaigns to the operator's production BD Email Workbench and ensure its existing queue is resumed. Use when the operator says this batch, today arrange sending, batch queue, regional outreach, or delayed campaign sending. This skill preserves one company per selected email, submits the batch through Workbench, starts the existing Workbench app in the background only when needed, and verifies appsetting.queue_paused=false. It must not implement its own risk checks, SMTP loop, scheduler, worker, or send completion logic. Use workbench-send-mail instead for one reviewed email.
 ---
 
 # Workbench Batch Handoff

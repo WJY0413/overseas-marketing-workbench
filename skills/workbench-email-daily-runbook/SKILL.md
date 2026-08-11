@@ -1,6 +1,6 @@
 ---
 name: workbench-email-daily-runbook
-description: Route the operator's daily Overseas Marketing Workbench operations and use narrower Workbench skills when possible. Use when the operator asks broad or mixed Workbench questions about sendability, drafts, queues, sending, inbox replies, bounces, sender/template/signature checks, or routine parameters. Prefer workbench-send-mail for sending, workbench-inbox-check for inbox/reply checks, workbench-queue-builder for queue creation, and workbench-parameter-tuner for common setting changes.
+description: Route the operator's daily BD Email Workbench operations and use narrower Workbench skills when possible. Use when the operator asks broad or mixed Workbench questions about sendability, drafts, queues, sending, inbox replies, bounces, sender/template/signature checks, or routine parameters. Prefer workbench-send-mail for sending, workbench-inbox-check for inbox/reply checks, workbench-queue-builder for queue creation, and workbench-parameter-tuner for common setting changes.
 ---
 
 # Workbench Email Daily Runbook

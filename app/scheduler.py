@@ -32,7 +32,7 @@ def _scan_bounces_job() -> None:
 def start_scheduler() -> None:
     if scheduler.running:
         return
-    scheduler.add_job(_process_queue_job, "interval", minutes=1, id="process_queue", replace_existing=True)
+    scheduler.add_job(_process_queue_job, "interval", seconds=15, id="process_queue", replace_existing=True)
     scheduler.add_job(_scan_followups_job, "interval", hours=1, id="scan_followups", replace_existing=True)
     scheduler.add_job(
         _scan_bounces_job,
