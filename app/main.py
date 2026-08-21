@@ -1,4 +1,4 @@
-﻿import json
+import json
 import logging
 import re
 from base64 import b64decode
@@ -8,15 +8,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import delete, func
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.db import create_db_and_tables, engine, get_session
-from app.models import BounceRecord, Company, Contact, ContactRoute, DraftPrepItem, EmailDraft, EmailEvent, EmailTemplate, FollowUpRule, SendRecord, SenderAccount, Suppression
+from app.db import create_db_and_tables, engine, get_session, is_unified_database
+from app.models import BounceRecord, Company, Contact, ContactRoute, DraftPrepItem, EmailDraft, EmailEvent, EmailTemplate, FollowUpRule, QueueHandoffRun, SendRecord, SenderAccount, Suppression, TemplateRotationPolicy
 from app.scheduler import scheduler, start_scheduler, stop_scheduler
 from app.seed import seed_defaults
 from app.services.docx_templates import parse_docx_email_template, parse_docx_signature_html
@@ -29,11 +29,14 @@ from app.services.no_go_companies import (
 from app.services.email_quality import validate_contact_email
 from app.services.app_settings import is_queue_paused, set_app_setting
 from app.services.bd_master_sync import get_bd_master_sync_status, run_bd_master_sync
+from app.services.followup_cadence import generate_dual_counter_followups, get_followup_cadence, save_followup_cadence
+from app.services.suppression import suppression_matches_email
 from app.services.queue import (
     audit_draft,
     apply_audit_result,
     approve_draft,
     cancel_queued_draft,
+    create_queue_handoff,
     daily_sent_count,
     format_sender_windows,
     next_window_start,
@@ -42,7 +45,7 @@ from app.services.queue import (
     process_due_queue,
     queue_draft,
     recipient_company_domain,
-    recent_company_send_records,
+    recent_duplicate_thread_send_records,
     refresh_draft_from_template,
     refresh_pending_audits,
     scan_followups,
@@ -53,6 +56,7 @@ from app.services.queue import (
 )
 from app.services.reports import export_sending_report
 from app.services.bounce_scanner import bounce_log_path, scan_bounces
+from app.services.batch_planner import build_batch_plan, ensure_rotation_policies, ensure_rotation_policy, update_rotation_policy
 from app.services.queue_state import reconcile_queue_state
 from app.services.power_awake import release_system_awake, sync_power_awake
 from app.services.sending_limits import DEFAULT_RECOMMENDED_DAILY_LIMIT, get_sending_limit_advice
@@ -74,16 +78,19 @@ from app.services.signatures import (
     signature_context,
     upsert_signature_template,
 )
+from app.services.render_validation import TemplateFieldResolutionError, validate_template_source
 from app.services.templates import render_template
+from app.services.linkedin_connections import LinkedInConnectionError, confirm as confirm_linkedin_connections, list_candidates as linkedin_candidates, recent_workbench_confirmations, restore_mistag, today_metrics as linkedin_today_metrics
 from app.time_utils import display_dt, local_now, utc_now
 from app.version import APP_VERSION
 
-app = FastAPI(title="海外营销 Workbench")
+app = FastAPI(title="BD Email Workbench Lite")
 logger = logging.getLogger(__name__)
 templates = Jinja2Templates(directory="app/templates")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 PIXEL = b64decode("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==")
 DRAFT_GENERATE_BATCH_SIZE = 50
+CRM_CANDIDATE_PAGE_SIZE = 10
 PLACEHOLDER_SENDER_EMAIL = "your.name@example.com"
 
 
@@ -96,7 +103,7 @@ templates.env.globals["attachment_paths_text"] = attachment_paths_text
 
 def _clear_startup_workspace(session: Session) -> None:
     session.exec(delete(DraftPrepItem))
-    # EmailDraft is durable review/queue evidence. A Workbench restart must
+    # EmailDraft is durable review/queue evidence.  A Workbench restart must
     # never erase a prepared batch before the native handoff can process it.
 
 
@@ -110,16 +117,32 @@ def startup() -> None:
         _clear_startup_workspace(session)
         session.commit()
     seed_defaults()
-    try:
-        sync_result = run_bd_master_sync(engine, settings.bd_database_path)
-    except Exception as exc:
-        logger.exception("BD master startup sync raised before it could persist a failed audit run.")
+    with Session(engine) as session:
+        # Existing templates receive one durable policy at migration time.  The
+        # planner itself never writes or falls back to a template-ID whitelist.
+        # Startup-gate unit tests intentionally replace Session with a small
+        # lifecycle double; policy migration belongs only to a real DB session.
+        if hasattr(session, "exec"):
+            ensure_rotation_policies(session)
+        session.commit()
+    if is_unified_database() or settings.bd_database_path is None:
         sync_result = {
-            "status": "failed",
+            "status": "local_unified_database",
             "run_id": None,
-            "error": str(exc),
-            "scheduler_safe": False,
+            "error": None,
+            "scheduler_safe": True,
         }
+    else:
+        try:
+            sync_result = run_bd_master_sync(engine, settings.bd_database_path)
+        except Exception as exc:
+            logger.exception("BD master startup sync raised before it could persist a failed audit run.")
+            sync_result = {
+                "status": "failed",
+                "run_id": None,
+                "error": str(exc),
+                "scheduler_safe": False,
+            }
     if sync_result["scheduler_safe"]:
         with Session(engine) as session:
             sync_power_awake(session)
@@ -260,6 +283,11 @@ def _create_mail_template_version(
     is_active: bool = True,
     replaces_template_id: int | None = None,
 ) -> EmailTemplate:
+    validate_template_source(
+        subject=subject.strip(),
+        body_html=body_html,
+        body_text=body_text,
+    )
     template = EmailTemplate(
         name=name.strip(),
         template_type=template_type,
@@ -273,6 +301,8 @@ def _create_mail_template_version(
     session.add(template)
     session.flush()
     _deactivate_same_name_templates(session, template.id, template.name)
+    if template.template_type == "first_touch":
+        ensure_rotation_policy(session, template, replaces_template_id=replaces_template_id)
     if replaces_template_id is not None and is_active:
         rules = session.exec(
             select(FollowUpRule).where(FollowUpRule.template_id == replaces_template_id)
@@ -435,7 +465,7 @@ def _contact_send_rank(contact: Contact) -> tuple[int, int, int]:
 
 def _is_cc_contact(contact: Contact) -> bool:
     label = f"{contact.full_name or ''} {contact.position or ''}".lower()
-    return is_generic_email(contact.email) or "team" in label or "general inbox" in label or "public inbox" in label or " cc" in f" {label}"
+    return is_generic_email(contact.email or "") or "team" in label or "general inbox" in label or "public inbox" in label or " cc" in f" {label}"
 
 
 def _preferred_contact_for_company(contacts: list[Contact]) -> Contact:
@@ -613,10 +643,7 @@ def _crm_candidate_contacts(
     priority: str,
 ) -> list[Contact]:
     company_by_id = {company.id: company for company in companies}
-    suppressions = {
-        suppression.email
-        for suppression in session.exec(select(Suppression)).all()
-    }
+    suppressions = session.exec(select(Suppression)).all()
     before_dt = _parse_filter_date(last_before, end_of_day=True)
     after_dt = _parse_filter_date(last_after)
     country_value = country.strip().lower()
@@ -626,7 +653,10 @@ def _crm_candidate_contacts(
         company = company_by_id.get(contact.company_id)
         if contact.status != "active" or company is None:
             continue
-        if contact.email.strip().lower() in suppressions:
+        contact_email = (contact.email or "").strip().lower()
+        if not contact_email:
+            continue
+        if any(suppression_matches_email(item, contact_email) for item in suppressions):
             continue
         if company.status in {"unsubscribed", "paused", "blacklisted"}:
             continue
@@ -822,11 +852,19 @@ def index(
     crm_last_after: str = "",
     crm_country: str = "",
     crm_priority: str = "",
+    crm_page: int = 1,
     session: Session = Depends(get_session),
 ):
     refresh_pending_audits(session)
     companies = session.exec(select(Company).order_by(Company.updated_at.desc())).all()
-    contacts = session.exec(select(Contact).order_by(Contact.created_at.desc())).all()
+    # The unified database retains all raw BD contact rows, including rows that
+    # have no sendable email. The dashboard only needs email-bearing contacts;
+    # filtering them in SQL avoids rendering thousands of non-actionable rows.
+    contacts = session.exec(
+        select(Contact)
+        .where(Contact.email.is_not(None), Contact.email != "")
+        .order_by(Contact.created_at.desc())
+    ).all()
     routes_by_contact = _routes_by_contact(session, [contact.id for contact in contacts if contact.id is not None])
     approved_drafts = session.exec(
         select(EmailDraft).where(EmailDraft.status == "approved").order_by(EmailDraft.approved_at.desc()).limit(250)
@@ -835,7 +873,7 @@ def index(
         select(EmailDraft)
         .where(EmailDraft.status == "pending_review")
         .order_by(EmailDraft.updated_at.desc())
-        .limit(250)
+        .limit(10)
     ).all()
     queue_drafts = session.exec(
         select(EmailDraft).where(EmailDraft.status == "queued").order_by(EmailDraft.scheduled_at).limit(250)
@@ -854,20 +892,13 @@ def index(
     contact_by_id = {contact.id: contact for contact in contacts}
     sender_by_id = {sender.id: sender for sender in senders}
     template_by_id = {template.id: template for template in email_templates}
-    queue_previews: dict[int, dict[str, str]] = {}
-    for draft in queue_drafts:
-        preview = {"subject": draft.subject, "body_html": draft.body_html}
-        company = company_by_id.get(draft.company_id)
-        contact = contact_by_id.get(draft.contact_id)
-        sender = sender_by_id.get(draft.sender_account_id)
-        template = template_by_id.get(draft.template_id)
-        if company and contact and sender and template:
-            try:
-                subject, body_html, _, _ = render_template(template, company, contact, session=session, sender=sender)
-                preview = {"subject": subject, "body_html": body_html}
-            except Exception:
-                pass
-        queue_previews[draft.id] = preview
+    # Queue intake creates the immutable rendered snapshot once. Re-rendering
+    # every queued draft just to paint this page was both misleading and a
+    # large N+1 cost on a populated queue.
+    queue_previews = {
+        draft.id: {"subject": draft.subject, "body_html": draft.body_html}
+        for draft in queue_drafts
+    }
     queue_drafts = _sort_queue_drafts(queue_drafts, company_by_id, contact_by_id, queue_sort, queue_dir)
     queue_state = reconcile_queue_state(session)
     queue_paused = queue_state["is_paused"]
@@ -883,7 +914,7 @@ def index(
         and contact.status == "active"
         and company_by_id.get(contact.company_id) is not None
     ]
-    crm_candidate_contacts = _crm_candidate_contacts(
+    all_crm_candidate_contacts = _crm_candidate_contacts(
         session,
         companies,
         contacts,
@@ -893,6 +924,11 @@ def index(
         crm_country,
         crm_priority,
     )
+    crm_candidate_total = len(all_crm_candidate_contacts)
+    crm_page_count = max(1, (crm_candidate_total + CRM_CANDIDATE_PAGE_SIZE - 1) // CRM_CANDIDATE_PAGE_SIZE)
+    crm_page = min(max(1, crm_page), crm_page_count)
+    crm_page_start = (crm_page - 1) * CRM_CANDIDATE_PAGE_SIZE
+    crm_candidate_contacts = all_crm_candidate_contacts[crm_page_start : crm_page_start + CRM_CANDIDATE_PAGE_SIZE]
     return templates.TemplateResponse(
         "index.html",
         {
@@ -913,6 +949,9 @@ def index(
             "has_queued_drafts": queue_state["has_queue"],
             "queue_state": queue_state,
             "crm_candidate_contacts": crm_candidate_contacts,
+            "crm_candidate_total": crm_candidate_total,
+            "crm_page": crm_page,
+            "crm_page_count": crm_page_count,
             "crm_filters": {
                 "followup": crm_followup,
                 "last_before": crm_last_before,
@@ -1130,6 +1169,38 @@ async def import_signature_docx(file: UploadFile, session: Session = Depends(get
     return _redirect_to("/settings", "Signature DOCX imported into the shared template store. Review the signature block before sending.")
 
 
+@app.get("/linkedin-connections")
+def linkedin_connections_page(request: Request, message: str = "", query: str = "", batch_size: int = 10):
+    try:
+        candidates = linkedin_candidates(get_settings().linkedin_master_path, query=query, batch_size=batch_size)
+        metrics = linkedin_today_metrics(get_settings().linkedin_master_path)
+        confirmed = recent_workbench_confirmations(get_settings().linkedin_master_path)
+    except LinkedInConnectionError as exc:
+        candidates, metrics, confirmed, message = [], {"people": 0, "batches": 0}, [], str(exc)
+    return templates.TemplateResponse("linkedin_connections.html", {"request": request, "app_version": APP_VERSION, "message": message, "query": query, "batch_size": batch_size, "candidates": candidates, "metrics": metrics, "confirmed": confirmed})
+
+@app.post("/linkedin-connections/confirm")
+def confirm_linkedin_connection_batch(request: Request, source_record_ids: list[str] = Form(default=[]), batch_size: int = Form(10)):
+    mode = "single" if len(source_record_ids) == 1 else "batch"
+    try:
+        result = confirm_linkedin_connections(get_settings().linkedin_master_path, source_record_ids, mode=mode, backup_dir=get_settings().data_dir / "linkedin_backups")
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "changed": result["changed"], "mode": mode})
+        return _redirect_to("/linkedin-connections", f"Confirmed {len(result['changed'])} LinkedIn connection record(s).")
+    except LinkedInConnectionError as exc:
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return _redirect_to(f"/linkedin-connections?batch_size={batch_size}", str(exc))
+
+@app.post("/linkedin-connections/{source_record_id}/restore")
+def restore_linkedin_mistag(source_record_id: str, request: Request):
+    try:
+        restore_mistag(get_settings().linkedin_master_path, source_record_id)
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "source_record_id": source_record_id})
+        return _redirect_to("/linkedin-connections", "LinkedIn mistag restored.")
+    except LinkedInConnectionError as exc:
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return _redirect_to("/linkedin-connections", str(exc))
+
+
 @app.get("/crm")
 def crm_page(request: Request, message: str = "", session: Session = Depends(get_session)):
     companies = session.exec(select(Company).order_by(Company.updated_at.desc())).all()
@@ -1198,6 +1269,7 @@ def rules_page(request: Request, message: str = "", session: Session = Depends(g
             "app_version": APP_VERSION,
             "message": message,
             "rules": rules,
+            "cadence": get_followup_cadence(session),
             "templates": email_templates,
             "stats": _dashboard_stats(session),
         },
@@ -1413,6 +1485,64 @@ def templates_page(request: Request, message: str = "", session: Session = Depen
     )
 
 
+@app.get("/planner")
+def planner_page(request: Request, message: str = "", session: Session = Depends(get_session)):
+    first_touch_templates = session.exec(
+        select(EmailTemplate)
+        .where(EmailTemplate.template_type == "first_touch", EmailTemplate.is_active == True)
+        .order_by(EmailTemplate.name)
+    ).all()
+    policies = {
+        policy.template_id: policy
+        for policy in session.exec(select(TemplateRotationPolicy)).all()
+    }
+    return templates.TemplateResponse(
+        "planner.html",
+        {
+            "request": request,
+            "settings": get_settings(),
+            "app_version": APP_VERSION,
+            "message": message,
+            "template_rows": [
+                {"template": template, "policy": policies.get(template.id)}
+                for template in first_touch_templates
+            ],
+            "stats": _dashboard_stats(session),
+        },
+    )
+
+
+@app.post("/planner/policies/{template_id}")
+def save_planner_policy(
+    template_id: int,
+    scope: str = Form("general"),
+    match_keywords: str = Form(""),
+    priority: int = Form(100),
+    is_enabled: bool = Form(False),
+    session: Session = Depends(get_session),
+):
+    try:
+        update_rotation_policy(
+            session,
+            template_id,
+            scope=scope,
+            match_keywords=match_keywords,
+            priority=priority,
+            is_enabled=is_enabled,
+        )
+    except ValueError as exc:
+        return _redirect_to("/planner", str(exc))
+    session.commit()
+    return _redirect_to("/planner", "模板轮换策略已保存。")
+
+
+@app.post("/api/planner/run")
+def run_integrated_planner(limit: int = Form(5000), session: Session = Depends(get_session)):
+    """Read-only planning endpoint; it cannot create a draft, queue item, or send."""
+    bounded_limit = max(1, min(limit, 5000))
+    return JSONResponse(build_batch_plan(session, limit=bounded_limit))
+
+
 @app.post("/templates")
 def create_template(
     name: str = Form(...),
@@ -1426,16 +1556,19 @@ def create_template(
 ):
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    _create_mail_template_version(
-        session,
-        name=name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=cc_enabled,
-        cc_emails=cc_emails,
-    )
+    try:
+        _create_mail_template_version(
+            session,
+            name=name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=cc_enabled,
+            cc_emails=cc_emails,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to("/templates", "Template version saved with a new immutable ID.")
 
@@ -1500,18 +1633,21 @@ def update_template(
         return _redirect_to("/templates", "Template not found.")
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    new_template = _create_mail_template_version(
-        session,
-        name=name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=cc_enabled,
-        cc_emails=cc_emails,
-        is_active=is_active,
-        replaces_template_id=template.id,
-    )
+    try:
+        new_template = _create_mail_template_version(
+            session,
+            name=name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=cc_enabled,
+            cc_emails=cc_emails,
+            is_active=is_active,
+            replaces_template_id=template.id,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to(
         "/templates",
@@ -1568,16 +1704,19 @@ async def import_template_file(
         return _redirect_to("/templates", "Template file is empty.")
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    _create_mail_template_version(
-        session,
-        name=name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=False,
-        cc_emails=None,
-    )
+    try:
+        _create_mail_template_version(
+            session,
+            name=name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=False,
+            cc_emails=None,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to("/templates", "Template imported as a new immutable version.")
 
@@ -1600,16 +1739,19 @@ async def import_docx_template_file(
         subject, body_html, body_text = parse_docx_email_template(payload, fallback_subject=subject)
     except ValueError as exc:
         return _redirect_to("/templates", str(exc))
-    _create_mail_template_version(
-        session,
-        name=template_name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=False,
-        cc_emails=None,
-    )
+    try:
+        _create_mail_template_version(
+            session,
+            name=template_name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=False,
+            cc_emails=None,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to("/templates", f"DOCX template imported as a new immutable version. Subject: {subject}")
 
@@ -1955,6 +2097,9 @@ def start_send_batch(
     force_recent_send: bool = Form(False),
     session: Session = Depends(get_session),
 ):
+    # Direct Python callers see FastAPI's Form default object; HTTP callers
+    # receive a real bool. Only an explicit True is an override.
+    force_recent_send = force_recent_send is True
     if not draft_ids:
         return _redirect("Please select at least one approved draft before starting.")
     selected_sender_ids = sender_ids or ([sender_id] if sender_id is not None else [])
@@ -1988,86 +2133,23 @@ def start_send_batch(
             return _redirect("Selected send template not found.")
         if is_signature_template(send_template):
             return _redirect("Signature templates cannot be used as send templates.")
-        refresh_errors: list[str] = []
-        refresh_error_ids: set[int] = set()
-        for draft in selected_drafts:
-            try:
-                refresh_draft_from_template(session, draft, send_template)
-                issues = audit_draft(session, draft)
-            except Exception as exc:
-                issues = [f"Template render error: {exc}"]
-            if issues:
-                draft.status = "pending_review"
-                draft.sender_account_id = None
-                draft.scheduled_at = None
-                draft.approved_at = None
-                draft.error_message = "; ".join(issues)
-                refresh_errors.append(f"Draft #{draft.id}: {draft.error_message}")
-                refresh_error_ids.add(draft.id)
-            elif draft.status in {"pending_review", "approved"}:
-                draft.status = "approved"
-                draft.approved_at = utc_now()
-                draft.error_message = None
-            draft.updated_at = utc_now()
-            session.add(draft)
-        session.commit()
-        if refresh_errors:
-            selected_drafts = [draft for draft in selected_drafts if draft.id not in refresh_error_ids]
-            if not selected_drafts:
-                return _redirect(f"Template refresh blocked all selected drafts. First issue: {refresh_errors[0]}")
-    recent_records = recent_company_send_records(session, {draft.company_id for draft in selected_drafts}, hours=8)
-    local_exclusions.extend(refresh_errors)
-    if recent_records and not force_recent_send:
-        recent_company_ids = {record.company_id for record in recent_records}
-        recent_drafts = [draft for draft in selected_drafts if draft.company_id in recent_company_ids]
-        for draft in recent_drafts:
-            company = session.get(Company, draft.company_id)
-            name = company.name if company else f"Company #{draft.company_id}"
-            draft.status = "pending_review"
-            draft.sender_account_id = None
-            draft.scheduled_at = None
-            draft.approved_at = None
-            draft.error_message = "Company has a successful send within the last 8 hours."
-            draft.updated_at = utc_now()
-            session.add(draft)
-            local_exclusions.append(f"Draft #{draft.id}: recent send guard for {name}")
-        session.commit()
-        selected_drafts = [draft for draft in selected_drafts if draft.company_id not in recent_company_ids]
-        if not selected_drafts:
-            return _redirect(
-                "Blocked: all selected drafts are inside the 8-hour recent-send guard. "
-                f"First issue: {local_exclusions[0]}"
-            )
-    draft_ids = [draft.id for draft in selected_drafts]
-    set_app_setting(session, "queue_paused", "false")
-    queued = 0
-    skipped = 0
-    errors: list[str] = list(local_exclusions)
-    queued_draft_ids: list[int] = []
-    for index, draft_id in enumerate(draft_ids):
-        sender = senders[index % len(senders)]
-        try:
-            queue_draft(session, draft_id, sender.id, commit=False)
-            queued += 1
-            queued_draft_ids.append(draft_id)
-            if recent_records and force_recent_send:
-                session.add(EmailEvent(draft_id=draft_id, event_type="recent_send_override"))
-        except ValueError as exc:
-            skipped += 1
-            errors.append(str(exc))
-    session.commit()
-    processed_now = {"sent": 0, "failed": 0, "skipped": 0}
-    if queued_draft_ids:
-        processed_now = process_due_queue(session, limit=1, draft_ids=queued_draft_ids)
-    queue_state = reconcile_queue_state(session)
-    sync_power_awake(session)
-    if errors:
-        return _redirect(
-            f"Started sending with local exclusions: queued={queued}, excluded={len(errors)}, "
-            f"first exclusion={errors[0]}. Current queue={queue_state['queued_count']}."
+    try:
+        handoff = create_queue_handoff(
+            session,
+            [draft.id for draft in selected_drafts],
+            [sender.id for sender in senders],
+            selected_template_id,
+            send_mode,
+            allow_recent_duplicate=force_recent_send,
         )
+    except ValueError as exc:
+        return _redirect(str(exc))
+    sync_power_awake(session)
+    exclusion_note = f" Local roster exclusions: {len(local_exclusions)}." if local_exclusions else ""
     return _redirect(
-        f"Started sending: mode={send_mode}, sender_count={len(senders)}, queued {queued} draft(s). Current queue={queue_state['queued_count']}. Immediate processing: sent={processed_now['sent']}, failed={processed_now['failed']}, skipped={processed_now['skipped']}. Minimum interval is strictly 30 seconds."
+        f"Started sending: {handoff.total_count} draft(s) accepted as one queue intake. "
+        f"It will import continuously in batches of {handoff.batch_size} with no further confirmation."
+        f"{exclusion_note}"
     )
 
 
@@ -2156,10 +2238,53 @@ def process_queue_now(session: Session = Depends(get_session)):
     return _redirect(f"Queue processed: sent={result['sent']}, failed={result['failed']}, skipped={result['skipped']}.")
 
 
+@app.get("/queue/handoff/status")
+def queue_handoff_status(session: Session = Depends(get_session)):
+    """Read-only progress for the current or most recent one-click intake."""
+    handoff = session.exec(
+        select(QueueHandoffRun).order_by(QueueHandoffRun.created_at.desc(), QueueHandoffRun.id.desc())
+    ).first()
+    if handoff is None:
+        return {"status": "idle", "total": 0, "cursor": 0, "queued": 0, "excluded": 0, "last_error": None}
+    return {
+        "id": handoff.id,
+        "status": handoff.status,
+        "total": handoff.total_count,
+        "cursor": handoff.cursor,
+        "queued": handoff.queued_count,
+        "excluded": handoff.excluded_count,
+        "batch_size": handoff.batch_size,
+        "last_error": handoff.last_error,
+        "updated_at": handoff.updated_at,
+    }
+
+
 @app.post("/followups/scan")
 def scan_followups_now(session: Session = Depends(get_session)):
     result = scan_followups(session)
     return _redirect(f"Follow-up scan created {result['followup_drafts']} pending-review draft(s).")
+
+
+@app.post("/followups/generate-batch")
+def generate_followup_batch(
+    template_id: int = Form(...),
+    limit: int = Form(250),
+    priorities: str = Form("A,B,C"),
+    session: Session = Depends(get_session),
+):
+    try:
+        result = generate_dual_counter_followups(
+            session,
+            template_id=template_id,
+            priorities=priorities,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return _redirect_to("/rules", str(exc))
+    return _redirect_to(
+        "/rules",
+        f"双计数器手动批次已生成 {result['followup_drafts']} / {limit} 封待审核草稿；未启用自动跟进，未发送邮件。",
+    )
 
 
 @app.post("/followup-rules")
@@ -2170,14 +2295,31 @@ def create_followup_rule(
     priorities: str = Form("A,B,C"),
     session: Session = Depends(get_session),
 ):
-    template = session.get(EmailTemplate, template_id)
-    if template is None:
-        return _redirect("Follow-up template not found.")
-    if is_signature_template(template):
-        return _redirect("Signature templates cannot be used for follow-up rules.")
-    session.add(FollowUpRule(name=name, delay_days=delay_days, template_id=template_id, priorities=priorities))
-    session.commit()
-    return _redirect("Follow-up rule saved.")
+    return _redirect_to("/rules", "旧版固定延迟规则已停用；请使用双计数器跟进规则。")
+
+
+@app.post("/followup-cadence")
+def update_followup_cadence(
+    enabled: bool = Form(False),
+    template_id: int | None = Form(None),
+    priorities: str = Form("A,B,C"),
+    session: Session = Depends(get_session),
+):
+    try:
+        cadence = save_followup_cadence(
+            session,
+            enabled=enabled,
+            template_id=template_id,
+            priorities=priorities,
+        )
+    except ValueError as exc:
+        return _redirect_to("/rules", str(exc))
+    state = "已启用" if cadence.enabled else "已保存为停用"
+    return _redirect_to(
+        "/rules",
+        f"双计数器跟进规则{state}：同一联系人每次成功发送后增加 {cadence.contact_step_hours}h；"
+        f"更换联系人时，公司级最短间隔 {cadence.company_switch_min_hours}h。",
+    )
 
 
 @app.post("/suppressions")

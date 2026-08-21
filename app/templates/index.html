@@ -65,13 +65,14 @@
               <label>上次跟进晚于<input type="date" name="crm_last_after" value="{{ crm_filters.last_after }}" /></label>
               <label>国家<input name="crm_country" value="{{ crm_filters.country }}" placeholder="Thailand" /></label>
               <label>等级<input name="crm_priority" value="{{ crm_filters.priority }}" placeholder="A / B / C" /></label>
+              <input type="hidden" name="crm_page" value="1" />
               <button class="secondary" type="submit">筛选 CRM 客户</button>
             </form>
             <form action="/draft-prep/add-from-crm" method="post">
               <div class="bulk-actions">
-                <label class="checkbox-line"><input type="checkbox" id="select-all-crm-candidates" /> 全选筛选结果</label>
+                <label class="checkbox-line"><input type="checkbox" id="select-all-crm-candidates" /> 全选本页</label>
                 <button type="submit">加入准备区</button>
-                <small>当前结果：{{ crm_candidate_contacts | length }} 个联系人</small>
+                <small>当前结果：{{ crm_candidate_total }} 个联系人；第 {{ crm_page }} / {{ crm_page_count }} 页（每页 10 条）</small>
               </div>
               <div class="table-wrap">
                 <table>
@@ -100,6 +101,30 @@
                 </table>
               </div>
             </form>
+            {% if crm_page_count > 1 %}
+              <div class="inline-actions">
+                {% if crm_page > 1 %}
+                  <form method="get" action="/">
+                    <input type="hidden" name="crm_followup" value="{{ crm_filters.followup }}" />
+                    <input type="hidden" name="crm_last_before" value="{{ crm_filters.last_before }}" />
+                    <input type="hidden" name="crm_last_after" value="{{ crm_filters.last_after }}" />
+                    <input type="hidden" name="crm_country" value="{{ crm_filters.country }}" />
+                    <input type="hidden" name="crm_priority" value="{{ crm_filters.priority }}" />
+                    <button class="secondary" name="crm_page" value="{{ crm_page - 1 }}">上一页</button>
+                  </form>
+                {% endif %}
+                {% if crm_page < crm_page_count %}
+                  <form method="get" action="/">
+                    <input type="hidden" name="crm_followup" value="{{ crm_filters.followup }}" />
+                    <input type="hidden" name="crm_last_before" value="{{ crm_filters.last_before }}" />
+                    <input type="hidden" name="crm_last_after" value="{{ crm_filters.last_after }}" />
+                    <input type="hidden" name="crm_country" value="{{ crm_filters.country }}" />
+                    <input type="hidden" name="crm_priority" value="{{ crm_filters.priority }}" />
+                    <button class="secondary" name="crm_page" value="{{ crm_page + 1 }}">下一页</button>
+                  </form>
+                {% endif %}
+              </div>
+            {% endif %}
           </details>
           <details class="template-editor">
             <summary>手动添加客户</summary>
@@ -305,7 +330,7 @@
                   <button class="start-button" type="submit" form="queue-state-action-form">{{ queue_state.button_label }}</button>
                 {% endif %}
                 <button class="secondary" type="submit" formaction="/drafts/bulk-delete" formnovalidate>删除所选草稿</button>
-                <label class="checkbox-line recent-override"><input name="force_recent_send" type="checkbox" value="true" /> 忽略 8 小时提醒</label>
+                <label class="checkbox-line recent-override"><input name="force_recent_send" type="checkbox" value="true" /> 允许 24 小时内同线程再次发送</label>
               </div>
             </div>
 

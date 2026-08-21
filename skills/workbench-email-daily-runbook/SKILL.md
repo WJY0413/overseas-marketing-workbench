@@ -1,6 +1,6 @@
 ---
 name: workbench-email-daily-runbook
-description: Route the operator's daily Overseas Marketing Workbench operations and use narrower Workbench skills when possible. Use when the operator asks broad or mixed Workbench questions about sendability, drafts, queues, sending, inbox replies, bounces, sender/template/signature checks, or routine parameters. Prefer workbench-send-mail for sending, workbench-inbox-check for inbox/reply checks, workbench-queue-builder for queue creation, and workbench-parameter-tuner for common setting changes.
+description: Route the operator's daily BD Email Workbench operations and use narrower Workbench skills when possible. Use when the operator asks broad or mixed Workbench questions about sendability, drafts, queues, sending, inbox replies, bounces, sender/template/signature checks, or routine parameters. Prefer workbench-send-mail for sending, workbench-inbox-check for inbox/reply checks, workbench-queue-builder for queue creation, and workbench-parameter-tuner for common setting changes.
 ---
 
 # Workbench Email Daily Runbook
@@ -11,7 +11,7 @@ Use this skill as the broad Workbench router and compatibility layer. For narrow
 - Use `workbench-inbox-check` for sender inbox search, reply checks, bounce clues, and delivery notices.
 - Use `workbench-queue-builder` for queue creation, sender distribution, schedule planning, and queue readiness.
 - Use `workbench-parameter-tuner` for sender daily limits, send windows, delay ranges, open tracking, active flags, and `queue_paused`.
-- Use `workbench-batch-planner` for deterministic read-only target counts, To/CC selection, layered exclusions, enterprise deduplication, sender capacity, and direct-draft readiness before any batch handoff.
+- Use `workbench-batch-planner` for Workbench v0.4.26+ integrated read-only planning at `/planner` / `/api/planner/run`; it reads persisted rotation policies rather than a static template-ID list.
 
 Do not use this skill for lead discovery, company scoring, rolling contact research, generic outreach strategy, or Codex maintenance.
 
@@ -51,7 +51,7 @@ Do not use this skill for lead discovery, company scoring, rolling contact resea
 | inbox, reply check, bounce clue, delivery notice, mailbox search | `workbench-inbox-check` |
 | create queue, queue approved drafts, distribute across senders, schedule queue | `workbench-queue-builder` |
 | daily limit, send window, delay range, open tracking, active flag, queue_paused | `workbench-parameter-tuner` |
-| sendable counts, exclusions, never-sent cohorts, today batch plan | `workbench-batch-planner` |
+| sendable counts, exclusions, already-arranged work, today batch plan | `workbench-batch-planner` via Workbench `/planner` |
 | generate drafts from template, follow-up draft generation, CC rules | `references/template-draft-generation.md` |
 | inspect/delete/unqueue/requeue drafts outside queue-building scope | `references/draft-and-queue-operations.md` |
 | signature or sender-render mismatch | `references/signature-and-sender-audit.md` |
@@ -72,6 +72,12 @@ For any broad Workbench email task, first collect:
 Then state the action boundary in Chinese, for example:
 
 `我只检查可发数量，不启动队列。当前 queue_paused=true。`
+
+## Arranged-Batch Readback
+
+After a confirmed batch is handed to Workbench, keep policy eligibility separate from execution readiness. Report `safe`, `already arranged`, `queued with planned recipient`, and `pending/approved exception` as different counts. A pending or approved draft is arranged work, but is not proof that it can actually send.
+
+For a queue handoff, defer to `workbench-queue-builder` for the recipient-snapshot readback and Jarvis native `workbench_queue_progress` probe registration. This observer reads Workbench directly and does not start a Codex/AI turn. Do not call a batch arranged-and-running until its queued primary recipient matches the planner-approved `selected_to` route.
 
 ## Tooling Preference
 

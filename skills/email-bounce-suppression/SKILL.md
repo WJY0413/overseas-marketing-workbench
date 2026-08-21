@@ -1,11 +1,11 @@
 ---
 name: email-bounce-suppression
-description: Operate the operator's Overseas Marketing Workbench bounce-mail, automatic-reply, route-replacement, and suppression workflow. Use when Codex needs to inspect Feishu/Lark mailbox bounces or auto-replies, preview delivery failures, handle retirement/leave/email-change notices, add suppressed recipient emails, remove or replace contact routes, review logs, or adjust the scanner policy. Preserve Contact and Company records while preventing unsuitable future sends.
+description: Operate the operator's BD Email Workbench bounce-mail, automatic-reply, route-replacement, and suppression workflow. Use when Codex needs to inspect Feishu/Lark mailbox bounces or auto-replies, preview delivery failures, handle retirement/leave/email-change notices, add suppressed recipient emails, remove or replace contact routes, review logs, or adjust the scanner policy. Preserve Contact and Company records while preventing unsuitable future sends.
 ---
 
 # Email Bounce Suppression
 
-Use this skill for 海外营销 Workbench 退信扫描、退信预览、退信邮箱剔除、suppression 写入和退信日志核查.
+Use this skill for BD Email Workbench退信扫描、退信预览、退信邮箱剔除、suppression写入和退信日志核查.
 
 ## Ground Rules
 

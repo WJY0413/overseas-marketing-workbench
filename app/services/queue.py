@@ -2,29 +2,41 @@ import random
 import re
 import json
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.models import Company, Contact, EmailDraft, EmailEvent, EmailTemplate, FollowUpRule, SendRecord, SenderAccount, Suppression
+from app.models import Company, Contact, EmailDraft, EmailEvent, EmailTemplate, QueueHandoffRun, SendRecord, SenderAccount, Suppression
 from app.services.email_quality import validate_contact_email
-from app.services.app_settings import is_queue_paused
+from app.services.feishu_native_reply import is_native_reply_draft, native_reply_metadata, send_queued_native_reply
+from app.services.app_settings import is_queue_paused, set_app_setting
 from app.services.mailer import send_draft
 from app.services.mailer import validate_attachment_paths
 from app.services.no_go_companies import is_no_go_company
 from app.services.queue_state import reconcile_queue_state
 from app.services.render_validation import SWITCH_TEMPLATE_GUIDANCE, rendered_message_field_issues
 from app.services.signatures import get_signature_template
+from app.services.suppression import suppression_matches_email
 from app.services.templates import render_template
 from app.time_utils import local_day_bounds_utc, utc_now
+from app.services.followup_cadence import scan_staged_followups
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_SEND_INTERVAL_SECONDS = 30
+RECENT_DUPLICATE_SEND_HOURS = 24
+NATIVE_REPLY_GLOBAL_MIN_INTERVAL_SECONDS = 45
+# Both sending and intake mutate the same SQLite queue.  One in-process gate
+# makes their write ownership explicit; database busy_timeout covers a second
+# process or a transient external reader/writer.
+QUEUE_PROCESSING_LOCK = Lock()
+QUEUE_HANDOFF_BATCH_SIZE = 50
 SHARED_RECIPIENT_DOMAINS = {
-    "aol.com", "btconnect.com", "gmail.com", "googlemail.com", "hotmail.com", "hotmail.co.uk",
-    "icloud.com", "live.com", "outlook.com", "yahoo.com",
+    "aol.com", "btconnect.com", "free.fr", "gmail.com", "googlemail.com", "hotmail.com",
+    "hotmail.co.uk", "icloud.com", "laposte.net", "live.com", "orange.fr", "outlook.com",
+    "proton.me", "protonmail.com", "wanadoo.fr", "yahoo.com", "yahoo.co.uk",
 }
 
 
@@ -59,7 +71,6 @@ def _parse_window_time(value: str):
 
 
 def parse_sender_windows_text(value: str, *, fallback_start=None, fallback_end=None) -> str:
-    """Validate a comma/newline-separated daytime window list and serialize it."""
     raw = (value or "").replace("\n", ",").strip(" ,")
     if not raw:
         if fallback_start is None or fallback_end is None:
@@ -80,14 +91,10 @@ def parse_sender_windows_text(value: str, *, fallback_start=None, fallback_end=N
     for previous, current in zip(windows, windows[1:]):
         if current[0] <= previous[1]:
             raise ValueError("Send windows cannot overlap or touch.")
-    return json.dumps(
-        [{"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")} for start, end in windows],
-        separators=(",", ":"),
-    )
+    return json.dumps([{"start": start.strftime("%H:%M"), "end": end.strftime("%H:%M")} for start, end in windows], separators=(",", ":"))
 
 
 def sender_windows(sender: SenderAccount) -> list[tuple[object, object]]:
-    """Return normalized configured windows, or the legacy single-window fallback."""
     try:
         payload = json.loads(sender.send_windows_json or "")
         if isinstance(payload, list) and payload:
@@ -113,6 +120,77 @@ def recipient_company_domain(email: str | None) -> str | None:
     return domain
 
 
+def _cc_recipients(value: str | None) -> list[str]:
+    return [email.strip() for email in (value or "").replace(";", ",").split(",") if email.strip()]
+
+
+def _active_suppression_for_email(session: Session, email: str | None) -> Suppression | None:
+    normalized = (email or "").strip().lower()
+    if not normalized:
+        return None
+    domain = normalized.rsplit("@", 1)[-1]
+    candidates = session.exec(
+        select(Suppression).where(func.lower(Suppression.email).in_([normalized, f"@{domain}"]))
+    ).all()
+    return next((item for item in candidates if suppression_matches_email(item, normalized)), None)
+
+
+def resolve_primary_contact(session: Session, company_id: str) -> Contact | None:
+    """Choose one company contact with a stable, documented ordering."""
+    contacts = session.exec(
+        select(Contact).where(Contact.company_id == company_id, Contact.status == "active")
+    ).all()
+    if not contacts:
+        return None
+
+    def rank(contact: Contact) -> tuple[int, int, int, int]:
+        email = (contact.email or "").strip().casefold()
+        generic = email.startswith(("info@", "sales@", "contact@", "hello@", "enquiries@", "office@"))
+        return (
+            0 if contact.is_primary else 1,
+            contact.priority_contact_rank if contact.priority_contact_rank is not None else 999999,
+            1 if generic else 0,
+            contact.id or 0,
+        )
+
+    return min(contacts, key=rank)
+
+
+def sanitize_cc_once(session: Session, draft: EmailDraft) -> list[dict[str, str]]:
+    """Remove unsafe CCs once, at queue intake, without blocking the To recipient."""
+    kept: list[str] = []
+    removed: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_email in _cc_recipients(draft.cc_emails):
+        email = raw_email.casefold()
+        if email in seen:
+            removed.append({"email": raw_email, "reason": "duplicate"})
+            continue
+        seen.add(email)
+        if not EMAIL_RE.match(raw_email):
+            removed.append({"email": raw_email, "reason": "invalid_format"})
+            continue
+        email_check = validate_contact_email(raw_email, check_deliverability=True)
+        if email_check.is_blocking:
+            removed.append({"email": raw_email, "reason": f"quality:{email_check.reason}"})
+            continue
+        suppression = _active_suppression_for_email(session, raw_email)
+        if suppression:
+            removed.append({"email": raw_email, "reason": f"suppressed:{suppression.reason}"})
+            continue
+        kept.append(raw_email)
+    draft.cc_emails = ", ".join(kept) or None
+    if removed:
+        session.add(
+            EmailEvent(
+                draft_id=draft.id,
+                event_type="cc_recipient_removed",
+                metadata_json=json.dumps({"removed": removed}, ensure_ascii=False),
+            )
+        )
+    return removed
+
+
 def audit_draft(session: Session, draft: EmailDraft) -> list[str]:
     contact = session.get(Contact, draft.contact_id)
     company = session.get(Company, draft.company_id)
@@ -132,25 +210,21 @@ def audit_draft(session: Session, draft: EmailDraft) -> list[str]:
     if contact is None:
         issues.append("Contact not found.")
     else:
-        email_check = validate_contact_email(contact.email.strip(), check_deliverability=True)
-        if email_check.is_blocking:
-            issues.append(f"Recipient email quality check failed: {email_check.reason}")
-        elif not EMAIL_RE.match(contact.email.strip()):
-            issues.append(f"Invalid recipient email: {contact.email}")
-        elif session.exec(select(Suppression).where(Suppression.email == contact.email.strip().lower())).first():
-            issues.append(f"Recipient is in suppression list: {contact.email}")
+        contact_email = (contact.email or "").strip()
+        if not contact_email:
+            issues.append("Missing recipient email.")
+        else:
+            email_check = validate_contact_email(contact_email, check_deliverability=True)
+            if email_check.is_blocking:
+                issues.append(f"Recipient email quality check failed: {email_check.reason}")
+            elif not EMAIL_RE.match(contact_email):
+                issues.append(f"Invalid recipient email: {contact.email}")
+            elif _active_suppression_for_email(session, contact_email):
+                issues.append(f"Recipient is in suppression list: {contact.email}")
     if company is None:
         issues.append("Company not found.")
     elif is_no_go_company(company):
         issues.append(f"Company is in NO-GO list: {company.name}")
-    if draft.cc_emails:
-        invalid_cc = [
-            email.strip()
-            for email in draft.cc_emails.replace(";", ",").split(",")
-            if email.strip() and not EMAIL_RE.match(email.strip())
-        ]
-        if invalid_cc:
-            issues.append(f"Invalid CC email: {', '.join(invalid_cc)}")
     issues.extend(validate_attachment_paths(draft.attachment_paths))
     if not draft.subject.strip():
         issues.append("Subject is empty.")
@@ -287,6 +361,35 @@ def _next_sender_queue_slot(session: Session, sender: SenderAccount) -> datetime
     return candidate
 
 
+def _last_global_sent_at(session: Session) -> datetime | None:
+    value = session.exec(
+        select(SendRecord.sent_at).order_by(SendRecord.sent_at.desc())
+    ).first()
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _next_global_queue_slot(session: Session, sender: SenderAccount) -> datetime:
+    """Reserve a queue slot after all queued or previously sent email.
+
+    Sender-specific windows and limits still apply, but all sender accounts share
+    one delivery timeline so that a multi-sender batch cannot burst together.
+    """
+    candidate = _next_sender_queue_slot(session, sender)
+    delay = timedelta(seconds=sender_interval_seconds(sender))
+    latest_queued_at = session.exec(
+        select(EmailDraft.scheduled_at)
+        .where(EmailDraft.status == "queued", EmailDraft.scheduled_at.is_not(None))
+        .order_by(EmailDraft.scheduled_at.desc(), EmailDraft.id.desc())
+    ).first()
+    latest_sent_at = _last_global_sent_at(session)
+    for previous_at in (latest_queued_at, latest_sent_at):
+        if previous_at is not None:
+            candidate = max(candidate, _as_aware_utc(previous_at) + delay)
+    return next_allowed_send_time(sender, candidate)
+
+
 def _reschedule_sender_queue_from(session: Session, sender: SenderAccount, start_at: datetime, event_type: str) -> int:
     schedule_at = start_at
     queued_drafts = _ordered_sender_queue(session, sender.id)
@@ -297,6 +400,42 @@ def _reschedule_sender_queue_from(session: Session, sender: SenderAccount, start
         session.add(EmailEvent(draft_id=draft.id, event_type=event_type))
         schedule_at = next_allowed_send_time(sender, schedule_at + timedelta(seconds=sender_interval_seconds(sender)))
     return len(queued_drafts)
+
+
+def _append_draft_to_sender_queue_tail(
+    session: Session,
+    sender: SenderAccount,
+    draft: EmailDraft,
+    earliest_at: datetime,
+) -> datetime:
+    """Move one delayed draft behind this sender's current queued tail.
+
+    This repairs an overdue draft without disturbing the schedule of other
+    queued work.  Each subsequent delayed draft observes the new tail and is
+    appended after it with its own configured randomized interval.
+    """
+    tail = session.exec(
+        select(EmailDraft)
+        .where(
+            EmailDraft.status == "queued",
+            EmailDraft.sender_account_id == sender.id,
+            EmailDraft.id != draft.id,
+            EmailDraft.scheduled_at.is_not(None),
+        )
+        .order_by(EmailDraft.scheduled_at.desc(), EmailDraft.id.desc())
+    ).first()
+    scheduled_at = earliest_at
+    if tail and tail.scheduled_at:
+        after_tail = _as_aware_utc(tail.scheduled_at) + timedelta(
+            seconds=sender_interval_seconds(sender)
+        )
+        if after_tail > scheduled_at:
+            scheduled_at = next_allowed_send_time(sender, after_tail)
+    draft.scheduled_at = scheduled_at
+    draft.updated_at = utc_now()
+    session.add(draft)
+    session.add(EmailEvent(draft_id=draft.id, event_type="sender_interval_tail_deferred"))
+    return scheduled_at
 
 
 def _last_sent_at(session: Session, sender_id: int) -> datetime | None:
@@ -312,19 +451,50 @@ def _last_sent_at(session: Session, sender_id: int) -> datetime | None:
     return value
 
 
-def recent_company_send_records(session: Session, company_ids: set[int], hours: int = 8) -> list[SendRecord]:
-    if not company_ids:
+def _last_native_reply_sent_at(session: Session) -> datetime | None:
+    value = session.exec(
+        select(EmailDraft.sent_at)
+        .where(
+            EmailDraft.status == "sent",
+            EmailDraft.sent_at.is_not(None),
+            EmailDraft.template_snapshot.contains("feishu_native_reply"),
+        )
+        .order_by(EmailDraft.sent_at.desc())
+    ).first()
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def normalize_thread_subject(subject: str | None) -> str:
+    """Normalize harmless display differences for duplicate-thread checks."""
+    return " ".join((subject or "").split()).casefold()
+
+
+def recent_duplicate_thread_send_records(
+    session: Session,
+    sender_id: int,
+    recipient_email: str,
+    subject: str,
+    hours: int = RECENT_DUPLICATE_SEND_HOURS,
+) -> list[SendRecord]:
+    """Return successful sends for the same sender, recipient, and thread in the window."""
+    recipient = (recipient_email or "").strip().casefold()
+    normalized_subject = normalize_thread_subject(subject)
+    if not recipient or not normalized_subject:
         return []
     cutoff = utc_now() - timedelta(hours=hours)
-    records = session.exec(
+    candidates = session.exec(
         select(SendRecord)
         .where(
-            SendRecord.company_id.in_(company_ids),
+            SendRecord.sender_account_id == sender_id,
+            func.lower(SendRecord.recipient_email) == recipient,
+            func.lower(SendRecord.smtp_status) == "sent",
             SendRecord.sent_at >= cutoff,
         )
         .order_by(SendRecord.sent_at.desc())
     ).all()
-    return records
+    return [record for record in candidates if normalize_thread_subject(record.subject) == normalized_subject]
 
 
 def queue_draft(
@@ -333,6 +503,9 @@ def queue_draft(
     sender_id: int,
     scheduled_at: datetime | None = None,
     commit: bool = True,
+    allow_recent_duplicate: bool = False,
+    refresh_before_queue: bool = True,
+    audit_before_queue: bool = True,
 ) -> EmailDraft:
     draft = session.get(EmailDraft, draft_id)
     sender = session.get(SenderAccount, sender_id)
@@ -340,6 +513,14 @@ def queue_draft(
         raise ValueError("Draft or sender not found.")
     if draft.status != "approved":
         raise ValueError("Draft must be marked handled before queuing.")
+    contact = session.get(Contact, draft.contact_id)
+    if contact is None:
+        raise ValueError("Draft contact not found.")
+    if recent_duplicate_thread_send_records(session, sender.id, contact.email, draft.subject) and not allow_recent_duplicate:
+        raise ValueError(
+            "Same sender, recipient, and subject already have a successful send within the last 24 hours. "
+            "Confirm the same-thread resend to continue."
+        )
     existing_company_queue = session.exec(
         select(EmailDraft).where(
             EmailDraft.company_id == draft.company_id,
@@ -349,7 +530,6 @@ def queue_draft(
     ).first()
     if existing_company_queue:
         raise ValueError("Company already has a queued draft. One company can only have one draft in a send batch.")
-    contact = session.get(Contact, draft.contact_id)
     target_domain = recipient_company_domain(contact.email if contact else None)
     if target_domain:
         queued_emails = session.exec(
@@ -362,8 +542,9 @@ def queue_draft(
                 f"Enterprise email domain already has a queued draft: {target_domain}. "
                 "One enterprise can only have one draft in a send batch."
             )
-    refresh_draft_from_current_template(session, draft, sender=sender)
-    issues = audit_draft(session, draft)
+    if refresh_before_queue:
+        refresh_draft_from_current_template(session, draft, sender=sender)
+    issues = audit_draft(session, draft) if audit_before_queue else []
     if issues:
         draft.status = "pending_review"
         draft.sender_account_id = None
@@ -378,7 +559,7 @@ def queue_draft(
         raise ValueError(draft.error_message)
     draft.sender_account_id = sender.id
     draft.status = "queued"
-    draft.scheduled_at = scheduled_at or _next_sender_queue_slot(session, sender)
+    draft.scheduled_at = scheduled_at or _next_global_queue_slot(session, sender)
     draft.updated_at = utc_now()
     session.add(draft)
     session.add(EmailEvent(draft_id=draft.id, event_type="queued"))
@@ -386,6 +567,181 @@ def queue_draft(
         session.commit()
         session.refresh(draft)
     return draft
+
+
+def _company_has_successful_template(session: Session, company_id: str, template_id: int) -> bool:
+    return session.exec(
+        select(SendRecord).where(
+            SendRecord.company_id == company_id,
+            SendRecord.template_id == template_id,
+            func.lower(SendRecord.smtp_status) == "sent",
+        )
+    ).first() is not None
+
+
+def _handoff_exclude(session: Session, draft: EmailDraft, reason: str) -> None:
+    draft.status = "pending_review"
+    draft.sender_account_id = None
+    draft.scheduled_at = None
+    draft.approved_at = None
+    draft.error_message = reason
+    draft.updated_at = utc_now()
+    session.add(draft)
+    session.add(EmailEvent(draft_id=draft.id, event_type="queue_handoff_excluded", metadata_json=reason))
+
+
+def create_queue_handoff(
+    session: Session,
+    draft_ids: list[int],
+    sender_ids: list[int],
+    template_id: int | None,
+    send_mode: str,
+    *,
+    allow_recent_duplicate: bool = False,
+) -> QueueHandoffRun:
+    """Persist a one-click intake request; the scheduler consumes 50 rows at a time."""
+    normalized_draft_ids = list(dict.fromkeys(draft_id for draft_id in draft_ids if draft_id))
+    normalized_sender_ids = list(dict.fromkeys(sender_id for sender_id in sender_ids if sender_id))
+    if not normalized_draft_ids or not normalized_sender_ids:
+        raise ValueError("A queue handoff needs drafts and at least one sender.")
+    if template_id is not None and session.get(EmailTemplate, template_id) is None:
+        raise ValueError("Selected send template not found.")
+    active = session.exec(
+        select(QueueHandoffRun).where(QueueHandoffRun.status.in_(("pending", "running")))
+    ).first()
+    if active:
+        raise ValueError("Another queue handoff is already importing. Check its progress before starting a new one.")
+    handoff = QueueHandoffRun(
+        draft_ids_json=json.dumps(normalized_draft_ids),
+        sender_ids_json=json.dumps(normalized_sender_ids),
+        template_id=template_id,
+        send_mode="rotate" if send_mode == "rotate" else "single",
+        allow_recent_duplicate=allow_recent_duplicate,
+        batch_size=QUEUE_HANDOFF_BATCH_SIZE,
+        total_count=len(normalized_draft_ids),
+    )
+    session.add(handoff)
+    # Preserve the existing start-send behaviour: the first imported chunk can
+    # proceed under the normal native queue scheduler without a second click.
+    set_app_setting(session, "queue_paused", "false", commit=False)
+    session.commit()
+    session.refresh(handoff)
+    return handoff
+
+
+def process_next_queue_handoff_batch(session: Session, handoff_id: str | None = None) -> dict[str, int | bool | str]:
+    """Import exactly one durable handoff chunk. Never retry an unknown write."""
+    if not QUEUE_PROCESSING_LOCK.acquire(blocking=False):
+        return {"queued": 0, "excluded": 0, "processed": 0, "busy": True}
+    try:
+        handoff = session.get(QueueHandoffRun, handoff_id) if handoff_id else session.exec(
+            select(QueueHandoffRun)
+            .where(QueueHandoffRun.status.in_(("pending", "running")))
+            .order_by(QueueHandoffRun.created_at, QueueHandoffRun.id)
+        ).first()
+        if handoff is None:
+            return {"queued": 0, "excluded": 0, "processed": 0, "idle": True}
+        draft_ids = json.loads(handoff.draft_ids_json)
+        sender_ids = json.loads(handoff.sender_ids_json)
+        start = handoff.cursor
+        chunk = draft_ids[start : start + max(1, handoff.batch_size)]
+        if not chunk:
+            handoff.status = "completed_with_exclusions" if handoff.excluded_count else "completed"
+            handoff.updated_at = utc_now()
+            session.add(handoff)
+            session.commit()
+            return {"queued": 0, "excluded": 0, "processed": 0, "status": handoff.status}
+        selected_template = session.get(EmailTemplate, handoff.template_id) if handoff.template_id is not None else None
+        queued = 0
+        excluded = 0
+        for offset, draft_id in enumerate(chunk):
+            draft = session.get(EmailDraft, draft_id)
+            sender_id = sender_ids[(start + offset) % len(sender_ids)]
+            sender = session.get(SenderAccount, sender_id)
+            if draft is None or sender is None or not sender.is_active:
+                excluded += 1
+                continue
+            contact = resolve_primary_contact(session, draft.company_id)
+            if contact is None:
+                _handoff_exclude(session, draft, "No active company contact is available for deterministic routing.")
+                excluded += 1
+                continue
+            draft.contact_id = contact.id
+            company = session.get(Company, draft.company_id)
+            if company is None or is_no_go_company(company):
+                _handoff_exclude(session, draft, "Company is in NO-GO list or no longer exists.")
+                excluded += 1
+                continue
+            # With no selector choice, the draft's own approved template is
+            # still the effective template and follows the same history rule.
+            effective_template = selected_template or (
+                session.get(EmailTemplate, draft.template_id) if draft.template_id is not None else None
+            )
+            if effective_template is not None and _company_has_successful_template(
+                session, draft.company_id, effective_template.id
+            ):
+                _handoff_exclude(session, draft, "Selected template was already successfully used for this company.")
+                excluded += 1
+                continue
+            try:
+                if effective_template is not None:
+                    refresh_draft_from_template(session, draft, effective_template, sender=sender)
+                # This is deliberately the only CC sanitation point. Send-time
+                # audit remains a hard gate for To/NO-GO, but does not mutate CC.
+                sanitize_cc_once(session, draft)
+                issues = audit_draft(session, draft)
+                if issues:
+                    _handoff_exclude(session, draft, "; ".join(issues))
+                    excluded += 1
+                    continue
+                draft.status = "approved"
+                draft.approved_at = utc_now()
+                draft.error_message = None
+                session.add(draft)
+                queue_draft(
+                    session,
+                    draft.id,
+                    sender.id,
+                    commit=False,
+                    allow_recent_duplicate=handoff.allow_recent_duplicate,
+                    refresh_before_queue=False,
+                    audit_before_queue=False,
+                )
+                queued += 1
+            except (ValueError, RuntimeError) as exc:
+                _handoff_exclude(session, draft, str(exc))
+                excluded += 1
+        handoff.cursor = start + len(chunk)
+        handoff.queued_count += queued
+        handoff.excluded_count += excluded
+        handoff.status = "running" if handoff.cursor < handoff.total_count else (
+            "completed_with_exclusions" if handoff.excluded_count else "completed"
+        )
+        handoff.updated_at = utc_now()
+        session.add(handoff)
+        session.commit()
+        session.refresh(handoff)
+        return {
+            "queued": queued,
+            "excluded": excluded,
+            "processed": len(chunk),
+            "status": handoff.status,
+            "cursor": handoff.cursor,
+            "total": handoff.total_count,
+        }
+    except Exception as exc:
+        session.rollback()
+        if handoff_id:
+            failed_handoff = session.get(QueueHandoffRun, handoff_id)
+            if failed_handoff:
+                failed_handoff.last_error = str(exc)
+                failed_handoff.status = "failed"
+                failed_handoff.updated_at = utc_now()
+                session.add(failed_handoff)
+                session.commit()
+        raise
+    finally:
+        QUEUE_PROCESSING_LOCK.release()
 
 
 def cancel_queued_draft(session: Session, draft: EmailDraft) -> None:
@@ -447,6 +803,16 @@ def _inside_sender_window(sender: SenderAccount, now: datetime) -> bool:
 
 
 def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | None = None) -> dict[str, int | bool]:
+    """Run one process-wide, globally serialized outbound queue pass."""
+    if not QUEUE_PROCESSING_LOCK.acquire(blocking=False):
+        return {"processed": 0, "sent": 0, "failed": 0, "skipped": 0, "deferred": 0, "paused": False, "busy": True}
+    try:
+        return _process_due_queue(session, limit=limit, draft_ids=draft_ids)
+    finally:
+        QUEUE_PROCESSING_LOCK.release()
+
+
+def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | None = None) -> dict[str, int | bool]:
     if is_queue_paused(session):
         return {"processed": 0, "sent": 0, "failed": 0, "skipped": 0, "deferred": 0, "paused": True}
 
@@ -474,16 +840,15 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
             failed += 1
         else:
             try:
-                refresh_draft_from_current_template(session, draft, sender=sender)
                 audit_issues = audit_draft(session, draft)
             except Exception as exc:
-                audit_issues = [f"Template refresh failed: {exc}"]
+                audit_issues = [f"Pre-send audit failed: {exc}"]
             if audit_issues:
                 draft.status = "pending_review"
                 draft.sender_account_id = None
                 draft.scheduled_at = None
                 draft.error_message = "; ".join(audit_issues)
-                session.add(EmailEvent(draft_id=draft.id, event_type="template_refresh_blocked", metadata_json=draft.error_message))
+                session.add(EmailEvent(draft_id=draft.id, event_type="pre_send_audit_blocked", metadata_json=draft.error_message))
                 failed += 1
             elif not _inside_sender_window(sender, utc_now()):
                 draft.scheduled_at = next_window_start(sender)
@@ -496,21 +861,51 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
                         "daily_limit_deferred",
                     )
                     deferred_sender_ids.add(sender.id)
-            elif session.exec(select(Suppression).where(Suppression.email == contact.email.lower())).first():
+            elif _active_suppression_for_email(session, contact.email):
                 draft.status = "skipped"
                 draft.error_message = "Suppressed email."
                 skipped += 1
             else:
-                last_sent_at = _last_sent_at(session, sender.id)
-                if last_sent_at is not None:
-                    next_allowed_at = last_sent_at + timedelta(seconds=MIN_SEND_INTERVAL_SECONDS)
+                is_native_reply = is_native_reply_draft(draft.template_snapshot)
+                if is_native_reply:
+                    last_native_sent_at = _last_native_reply_sent_at(session)
+                    if last_native_sent_at is not None:
+                        next_native_send_at = last_native_sent_at + timedelta(
+                            seconds=NATIVE_REPLY_GLOBAL_MIN_INTERVAL_SECONDS
+                        )
+                        if utc_now() < next_native_send_at:
+                            draft.scheduled_at = next_native_send_at
+                            draft.updated_at = utc_now()
+                            session.add(draft)
+                            continue
+                last_sender_sent_at = _last_sent_at(session, sender.id)
+                last_global_sent_at = _last_global_sent_at(session)
+                previous_send_at = max(
+                    (value for value in (last_sender_sent_at, last_global_sent_at) if value is not None),
+                    default=None,
+                )
+                if previous_send_at is not None:
+                    # Queue scheduling is global, and this is the durable send-time
+                    # guard for overdue work or drafts introduced by older versions.
+                    next_allowed_at = next_allowed_send_time(
+                        sender,
+                        _as_aware_utc(previous_send_at) + timedelta(seconds=sender_interval_seconds(sender)),
+                    )
                     if utc_now() < next_allowed_at:
-                        draft.scheduled_at = next_allowed_at
-                        draft.updated_at = utc_now()
-                        session.add(draft)
+                        _append_draft_to_sender_queue_tail(
+                            session,
+                            sender,
+                            draft,
+                            next_allowed_at,
+                        )
                         continue
                 try:
-                    send_result = send_draft(session, draft, sender)
+                    native_reply_result = None
+                    if is_native_reply:
+                        native_reply_result = send_queued_native_reply(draft, sender, contact)
+                        send_result = "sent"
+                    else:
+                        send_result = send_draft(session, draft, sender)
                     now = utc_now()
                     draft.status = "sent" if send_result == "sent" else "simulated"
                     draft.sent_at = now
@@ -521,12 +916,18 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
                             company.last_contact_at = now
                         company.updated_at = now
                         session.add(company)
-                    session.add(EmailEvent(draft_id=draft.id, event_type=draft.status))
+                    session.add(
+                        EmailEvent(
+                            draft_id=draft.id,
+                            event_type="feishu_native_reply_sent" if is_native_reply else draft.status,
+                            metadata_json=json.dumps(native_reply_result, ensure_ascii=False) if native_reply_result else None,
+                        )
+                    )
                     if send_result == "sent":
-                        session.add(
-                            SendRecord(
+                        send_record = SendRecord(
                                 draft_id=draft.id,
                                 company_id=draft.company_id,
+                                domain=company.domain if company else "",
                                 contact_id=draft.contact_id,
                                 sender_account_id=sender.id,
                                 template_id=draft.template_id,
@@ -534,25 +935,43 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
                                 sender_email=sender.email,
                                 recipient_email=contact.email,
                                 subject=draft.subject,
-                                body_html="",
-                                body_text=None,
+                                body_html=draft.body_html if is_native_reply else "",
+                                body_text=draft.body_text if is_native_reply else None,
                                 cc_emails=draft.cc_emails,
                                 attachment_paths=draft.attachment_paths,
                                 smtp_status="sent",
+                                activity_date=now,
                                 sent_at=now,
-                            )
+                                recipient_domain=contact.email.rsplit("@", 1)[-1].casefold(),
+                                raw_json=json.dumps(
+                                {"draft_id": draft.id, "tracking_id": draft.tracking_id},
+                                ensure_ascii=False,
+                            ),
                         )
+                        session.add(send_record)
+                        session.flush()
+                        send_record.source_record_id = str(send_record.id)
+                        send_record.activity_key = f"bd_email_workbench:sendrecord:{send_record.id}"
+                        session.add(send_record)
+                        if company:
+                            company.activity_record_count = (company.activity_record_count or 0) + 1
+                            session.add(company)
                         sent += 1
                     if send_result in {"sent", "simulated"}:
                         draft.body_html = ""
                         draft.body_text = None
-                        draft.template_snapshot = json.dumps(
-                            {
-                                "template_id": draft.template_id,
-                                "signature_template_id": draft.signature_template_id,
-                            },
-                            ensure_ascii=False,
-                        )
+                        if is_native_reply:
+                            snapshot = native_reply_metadata(draft.template_snapshot)
+                            snapshot["delivery_result"] = native_reply_result
+                            draft.template_snapshot = json.dumps(snapshot, ensure_ascii=False)
+                        else:
+                            draft.template_snapshot = json.dumps(
+                                {
+                                    "template_id": draft.template_id,
+                                    "signature_template_id": draft.signature_template_id,
+                                },
+                                ensure_ascii=False,
+                            )
                 except Exception as exc:
                     draft.status = "failed"
                     draft.error_message = str(exc)
@@ -565,73 +984,7 @@ def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | 
 
 
 def scan_followups(session: Session) -> dict[str, int]:
-    generated = 0
-    rules = session.exec(select(FollowUpRule).where(FollowUpRule.is_active == True)).all()
-    for rule in rules:
-        template = session.get(EmailTemplate, rule.template_id)
-        if template is None:
-            continue
-        cutoff = utc_now() - timedelta(days=rule.delay_days)
-        sent_drafts = session.exec(
-            select(EmailDraft).where(
-                EmailDraft.status == "sent",
-                EmailDraft.sent_at <= cutoff,
-            )
-        ).all()
-        for sent_draft in sent_drafts:
-            company = session.get(Company, sent_draft.company_id)
-            contact = session.get(Contact, sent_draft.contact_id)
-            if not company or not contact:
-                continue
-            if company.status in {"replied", "unsubscribed", "paused", "blacklisted"}:
-                continue
-            if company.priority not in {item.strip() for item in rule.priorities.split(",")}:
-                continue
-            existing = session.exec(
-                select(EmailDraft).where(
-                    EmailDraft.company_id == company.id,
-                    EmailDraft.contact_id == contact.id,
-                    EmailDraft.follow_up_step == sent_draft.follow_up_step + 1,
-                    EmailDraft.status.in_(["pending_review", "approved", "queued"]),
-                )
-            ).first()
-            if existing:
-                continue
-            signature_template = get_signature_template(session)
-            try:
-                subject, html, text, snapshot = render_template(template, company, contact, session=session)
-                render_error = None
-            except Exception as exc:
-                subject = template.subject
-                html = template.body_html
-                text = template.body_text
-                snapshot = json.dumps({"template_id": template.id, "render_error": str(exc)}, ensure_ascii=False)
-                render_error = f"Template render error: {exc}"
-            draft = EmailDraft(
-                company_id=company.id,
-                contact_id=contact.id,
-                template_id=template.id,
-                signature_template_id=signature_template.id if signature_template else None,
-                subject=subject,
-                body_html=html,
-                body_text=text,
-                cc_emails=template.cc_emails if template.cc_enabled else None,
-                follow_up_step=sent_draft.follow_up_step + 1,
-                template_snapshot=snapshot,
-            )
-            session.add(draft)
-            session.flush()
-            if render_error:
-                draft.status = "pending_review"
-                draft.error_message = render_error
-                draft.updated_at = utc_now()
-                session.add(draft)
-            else:
-                apply_audit_result(session, draft)
-            company.status = "follow_up_due"
-            company.next_follow_up_at = utc_now()
-            company.updated_at = utc_now()
-            session.add(company)
-            generated += 1
-    session.commit()
-    return {"followup_drafts": generated}
+    staged_result = scan_staged_followups(session)
+    # Fixed-delay FollowUpRule rows are retired: the dual-counter cadence is the
+    # only automated route.  A disabled cadence therefore creates nothing.
+    return staged_result or {"followup_drafts": 0}

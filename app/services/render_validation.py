@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 
-from jinja2 import Environment, StrictUndefined, meta
+from jinja2 import Environment, StrictUndefined, TemplateError, meta
 
 
 UNRESOLVED_VARIABLE_RE = re.compile(r"{{\s*[^{}]+\s*}}")
@@ -13,6 +14,23 @@ EMPTY_FIELD_VALUES = {"", "none", "null", "undefined", "nan"}
 SWITCH_TEMPLATE_GUIDANCE = (
     "Switch to another approved template that does not require the failed field(s)."
 )
+TEMPLATE_IMPORT_TEST_CONTEXT = {
+    "first_name": "TemplateFirstName",
+    "contact_name": "Template Contact",
+    "position": "Template Position",
+    "email": "template.contact@example.test",
+    "company": "Template Company Ltd",
+    "company_name": "Template Company Ltd",
+    "country": "United Kingdom",
+    "region": "England",
+    "company_type": "Groundcare Dealer",
+    "priority": "A",
+    "source": "Template validation",
+    "sender_name": "Template Sender",
+    "sender_email": "template.sender@example.test",
+    "signature_region": "UK",
+    "signature_phone": "+44 20 0000 0000",
+}
 
 
 class TemplateFieldResolutionError(ValueError):
@@ -63,6 +81,46 @@ def validate_template_context(
         )
 
 
+def validate_template_source(
+    *,
+    subject: str,
+    body_html: str,
+    body_text: str | None = None,
+    environment: Environment | None = None,
+) -> None:
+    """Validate a prospective template before it is persisted.
+
+    The test context intentionally gives every supported field a concrete,
+    distinctive value. This catches malformed placeholders such as
+    ``{company}``, which Jinja otherwise treats as ordinary text.
+    """
+    parser = environment or Environment(undefined=StrictUndefined, autoescape=True)
+    candidate = SimpleNamespace(
+        subject=subject,
+        body_html=body_html,
+        body_text=body_text,
+    )
+    try:
+        validate_template_context(candidate, TEMPLATE_IMPORT_TEST_CONTEXT, environment=parser)
+        rendered_subject = parser.from_string(subject).render(**TEMPLATE_IMPORT_TEST_CONTEXT)
+        rendered_html = parser.from_string(body_html).render(**TEMPLATE_IMPORT_TEST_CONTEXT)
+        rendered_text = (
+            parser.from_string(body_text).render(**TEMPLATE_IMPORT_TEST_CONTEXT)
+            if body_text
+            else None
+        )
+    except TemplateError as exc:
+        raise TemplateFieldResolutionError(
+            f"Template syntax or test rendering failed: {exc}. {SWITCH_TEMPLATE_GUIDANCE}"
+        ) from exc
+
+    validate_rendered_message(
+        subject=rendered_subject,
+        body_html=rendered_html,
+        body_text=rendered_text,
+    )
+
+
 def rendered_message_field_issues(
     *,
     subject: str | None,
@@ -82,6 +140,8 @@ def rendered_message_field_issues(
     for field_name, value in values:
         if field_name in {"subject", "recipient_email", "cc_emails"} and ("\r" in value or "\n" in value):
             issues.append(f"{field_name} contains a forbidden line break")
+        if field_name in {"subject", "body_html", "body_text"} and ("{" in value or "}" in value):
+            issues.append(f"{field_name} contains brace character(s) after rendering")
         unresolved = sorted(set(UNRESOLVED_VARIABLE_RE.findall(value)))
         if unresolved:
             issues.append(

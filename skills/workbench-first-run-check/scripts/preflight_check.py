@@ -127,7 +127,7 @@ def default_candidates() -> list[Path]:
         Path.cwd(),
         Path(r"C:\BD_Email_Workbench\production"),
         Path(r"C:\BD_Email_Workbench_Lite"),
-        Path(r"<detected-workbench-root>"),
+        Path(r"D:\BD_Email_Workbench\production"),
         user_profile / "BD_Email_Workbench" / "production",
         user_profile / "BD_Email_Workbench_Lite",
         user_profile / "Documents" / "bd-email-workbench-lite",
@@ -323,14 +323,14 @@ def environment_status(root: Path, health_url: str) -> tuple[bool, str]:
                 python_version = (int(match.group(1)), int(match.group(2)))
         except (OSError, subprocess.SubprocessError):
             return False, "existing virtual-environment Python is not runnable"
-    python_ok = python_version[0] == 3
+    python_ok = (3, 11) <= python_version < (3, 14)
     files_ok = (
         (root / "requirements.txt").is_file()
         and (root / "app" / "main.py").is_file()
         and ((root / "start.cmd").is_file() or (root / "start_production.cmd").is_file())
     )
     if not python_ok:
-        return False, f"Python 3 is required; found {python_version[0]}.{python_version[1]}"
+        return False, f"unsupported Python {python_version[0]}.{python_version[1]}"
     if not files_ok:
         return False, "required launcher or application files missing"
     if health_url:
@@ -340,7 +340,7 @@ def environment_status(root: Path, health_url: str) -> tuple[bool, str]:
                     return False, f"health check returned HTTP {response.status}"
         except Exception as exc:  # noqa: BLE001 - concise readiness result is intentional.
             return False, f"health check failed: {exc}"
-    return True, "launch files and runnable Python 3 found"
+    return True, "launch files and supported Python found"
 
 
 def duplicate_skill_dirs(skills_root: Path, skill_name: str) -> list[str]:

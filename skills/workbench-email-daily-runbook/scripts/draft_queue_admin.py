@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 
-DEFAULT_DB = Path(r"<detected-workbench-root>\data\workbench.db")
+DEFAULT_DB = Path(r"D:\BD_Email_Workbench\production\data\workbench.db")
 WRITABLE_TARGET_STATUSES = {"draft", "approved", "queued", "cancelled"}
 PROTECTED_STATUSES = {"sent", "sending"}
 

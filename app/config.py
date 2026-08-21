@@ -19,7 +19,11 @@ class Settings(BaseSettings):
     default_imap_port: int = 993
     dry_run_email: bool = True
     default_sender_name: str = "Your Name"
+    # The operational BDdb read model is SQLite. JSON remains an explicit
+    # compatibility input for archived/legacy exports only.
+    bd_database_sqlite_path: str | None = None
     bd_database_json_path: str | None = None
+    linkedin_master_sqlite_path: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -40,17 +44,26 @@ class Settings(BaseSettings):
 
     @property
     def bd_database_path(self) -> Path | None:
+        if self.bd_database_sqlite_path:
+            return Path(self.bd_database_sqlite_path).expanduser()
         if self.bd_database_json_path:
             return Path(self.bd_database_json_path).expanduser()
-        discovered = (
+        database_dir = (
             Path.home()
             / "Documents"
-            / "Overseas Marketing Workbench"
+            / "Fjd sales"
             / "bd_company_database"
             / "database"
-            / "bd_company_database.json"
         )
-        return discovered if discovered.is_file() else None
+        sqlite_source = database_dir / "bd_company_database.sqlite"
+        if sqlite_source.is_file():
+            return sqlite_source
+        legacy_json_source = database_dir / "bd_company_database.json"
+        return legacy_json_source if legacy_json_source.is_file() else None
+
+    @property
+    def linkedin_master_path(self) -> Path:
+        return Path(self.linkedin_master_sqlite_path or r"C:\Users\22524\Documents\Personal agent\linkedin_people_master.sqlite").expanduser()
 
 
 @lru_cache
