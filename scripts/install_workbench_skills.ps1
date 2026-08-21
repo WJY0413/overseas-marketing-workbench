@@ -22,6 +22,7 @@ $SourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $TargetRoot = [IO.Path]::GetFullPath($TargetRoot)
 $expectedSkills = @(
   "workbench-first-run-check",
+  "workbench-batch-planner",
   "workbench-email-daily-runbook",
   "workbench-send-mail",
   "workbench-inbox-check",

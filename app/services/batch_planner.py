@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlmodel import Session, select
 
 from app.models import Company, Contact, EmailDraft, EmailTemplate, SendRecord, Suppression, TemplateRotationPolicy
 from app.services.queue import resolve_primary_contact
 from app.services.suppression import suppression_matches_email
-from app.time_utils import utc_now
+from app.time_utils import as_utc, utc_now
 
 SUCCESS_STATUSES = {"sent", "delivered", "accepted"}
 ACTIVE_DRAFT_STATUSES = {"pending_review", "approved", "queued"}
@@ -27,6 +27,8 @@ SCOPE_MANUAL_ONLY = "manual_only"
 VALID_SCOPES = {SCOPE_GENERAL, SCOPE_SPORTS_LINE_MARKING, SCOPE_MANUAL_ONLY}
 SPECIALIST_DEFAULT_KEYWORDS = "sports,line marking,linemarking,pitch marking,stadium,football,golf,turf"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+COMPANY_SUCCESS_COOLDOWN_HOURS = 48
+RECIPIENT_SUCCESS_COOLDOWN_DAYS = 7
 
 
 def _normal(value: object) -> str:
@@ -119,11 +121,35 @@ def _eligible_primary_contact(session: Session, company_id: str, suppressions: l
         return None, "no_active_contact"
     if (contact.email_send_status or "include").casefold() != "include":
         return None, "contact_not_included"
+    if _normal(contact.priority_roll_status) == "success_locked":
+        return None, "source_success_locked"
     if not EMAIL_RE.match((contact.email or "").strip()):
         return None, "primary_email_invalid"
     if _is_suppressed(contact, suppressions):
         return None, "primary_recipient_suppressed"
     return contact, None
+
+
+def _latest_successes(session: Session) -> tuple[dict[str, datetime], dict[str, datetime], dict[str, set[int]]]:
+    """Return successful-send timestamps and historical template use by route."""
+    latest_company: dict[str, datetime] = {}
+    latest_recipient: dict[str, datetime] = {}
+    used_templates: dict[str, set[int]] = defaultdict(set)
+    for record in session.exec(select(SendRecord)).all():
+        if (record.smtp_status or "").casefold() not in SUCCESS_STATUSES:
+            continue
+        sent_at = as_utc(record.sent_at or record.activity_date)
+        if sent_at is None:
+            continue
+        company_id = record.company_id
+        if company_id and (company_id not in latest_company or sent_at > latest_company[company_id]):
+            latest_company[company_id] = sent_at
+        recipient_email = _normal(record.recipient_email)
+        if recipient_email and (recipient_email not in latest_recipient or sent_at > latest_recipient[recipient_email]):
+            latest_recipient[recipient_email] = sent_at
+        if record.template_id is not None:
+            used_templates[company_id].add(record.template_id)
+    return latest_company, latest_recipient, used_templates
 
 
 def build_batch_plan(session: Session, *, limit: int | None = None) -> dict:
@@ -148,10 +174,9 @@ def build_batch_plan(session: Session, *, limit: int | None = None) -> dict:
     active_company_ids = set(session.exec(
         select(EmailDraft.company_id).where(EmailDraft.status.in_(ACTIVE_DRAFT_STATUSES))
     ).all())
-    used_templates: dict[str, set[int]] = defaultdict(set)
-    for record in session.exec(select(SendRecord).where(SendRecord.template_id != None)).all():
-        if (record.smtp_status or "").casefold() in SUCCESS_STATUSES and record.template_id is not None:
-            used_templates[record.company_id].add(record.template_id)
+    latest_company_success, latest_recipient_success, used_templates = _latest_successes(session)
+    company_cooldown_cutoff = started_at - timedelta(hours=COMPANY_SUCCESS_COOLDOWN_HOURS)
+    recipient_cooldown_cutoff = started_at - timedelta(days=RECIPIENT_SUCCESS_COOLDOWN_DAYS)
 
     planned: list[dict] = []
     excluded: list[dict] = []
@@ -163,9 +188,15 @@ def build_batch_plan(session: Session, *, limit: int | None = None) -> dict:
         if _company_is_no_go(company):
             excluded.append({"company_id": company.id, "company": company.name, "reason": "no_go_company"})
             continue
+        if (last_success := latest_company_success.get(company.id)) and last_success >= company_cooldown_cutoff:
+            excluded.append({"company_id": company.id, "company": company.name, "reason": "company_48h_cooldown"})
+            continue
         contact, contact_reason = _eligible_primary_contact(session, company.id, suppressions)
         if contact is None:
             excluded.append({"company_id": company.id, "company": company.name, "reason": contact_reason})
+            continue
+        if (last_success := latest_recipient_success.get(_normal(contact.email))) and last_success >= recipient_cooldown_cutoff:
+            excluded.append({"company_id": company.id, "company": company.name, "reason": "recipient_7d_cooldown"})
             continue
         compatible = [
             template for template in enabled_templates
@@ -202,6 +233,9 @@ def build_batch_plan(session: Session, *, limit: int | None = None) -> dict:
             "no_compatible_unused_template": sum(
                 1 for item in excluded if item["reason"] == "no_compatible_unused_template"
             ),
+            "company_48h_cooldown": sum(1 for item in excluded if item["reason"] == "company_48h_cooldown"),
+            "recipient_7d_cooldown": sum(1 for item in excluded if item["reason"] == "recipient_7d_cooldown"),
+            "source_success_locked": sum(1 for item in excluded if item["reason"] == "source_success_locked"),
             "enabled_rotation_templates": len(enabled_templates),
         },
         "planned": planned,
