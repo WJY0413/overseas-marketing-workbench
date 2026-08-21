@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 from dataclasses import dataclass
 from io import BytesIO

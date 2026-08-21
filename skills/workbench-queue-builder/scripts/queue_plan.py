@@ -11,8 +11,8 @@ def bootstrap(app_dir: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read-only queue planning for Overseas Marketing Workbench.")
-    parser.add_argument("--app-dir", default=r"<detected-workbench-root>")
+    parser = argparse.ArgumentParser(description="Read-only queue planning for BD Email Workbench.")
+    parser.add_argument("--app-dir", default=r"D:\BD_Email_Workbench\production")
     parser.add_argument("--template-id", type=int)
     parser.add_argument("--status", default="approved")
     parser.add_argument("--senders", default="")

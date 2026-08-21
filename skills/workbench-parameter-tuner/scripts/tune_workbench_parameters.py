@@ -23,7 +23,7 @@ def parse_bool(value: str | None):
 
 def main():
     parser = argparse.ArgumentParser(description="Inspect or update common Workbench parameters.")
-    parser.add_argument("--app-dir", default=r"<detected-workbench-root>")
+    parser.add_argument("--app-dir", default=r"D:\BD_Email_Workbench\production")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--sender-email")
     parser.add_argument("--daily-limit", type=int)

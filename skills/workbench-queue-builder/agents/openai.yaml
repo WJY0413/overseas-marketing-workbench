@@ -1,4 +1,4 @@
 interface:
   display_name: "Workbench Batch Handoff"
   short_description: "Hand a confirmed batch to Workbench and resume its queue"
-  default_prompt: "Use $workbench-queue-builder to hand this confirmed batch to the existing Overseas Marketing Workbench and verify queue_paused=false without implementing a separate sender."
+  default_prompt: "Use $workbench-queue-builder to hand this confirmed batch to the existing BD Email Workbench and verify queue_paused=false without implementing a separate sender."

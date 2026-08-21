@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 
 
-DEFAULT_DB = Path(r"<detected-workbench-root>\data\workbench.db")
+DEFAULT_DB = Path(r"D:\BD_Email_Workbench\production\data\workbench.db")
 
 
 def main() -> int:

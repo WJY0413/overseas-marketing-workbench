@@ -54,7 +54,7 @@ def text_from_message(msg) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Read-only IMAP search for one Workbench sender inbox.")
-    parser.add_argument("--app-dir", default=r"<detected-workbench-root>")
+    parser.add_argument("--app-dir", default=r"D:\BD_Email_Workbench\production")
     parser.add_argument("--sender-email", required=True)
     parser.add_argument("--query", default="")
     parser.add_argument("--since-days", type=int, default=7)

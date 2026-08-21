@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 from copy import deepcopy
 from html import escape
