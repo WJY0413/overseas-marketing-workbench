@@ -22,12 +22,15 @@ $SourceRoot = [IO.Path]::GetFullPath($SourceRoot)
 $TargetRoot = [IO.Path]::GetFullPath($TargetRoot)
 $expectedSkills = @(
   "workbench-first-run-check",
+  "workbench-batch-planner",
   "workbench-email-daily-runbook",
   "workbench-send-mail",
   "workbench-inbox-check",
   "email-bounce-suppression",
   "workbench-queue-builder",
-  "workbench-parameter-tuner"
+  "workbench-parameter-tuner",
+  "linkedin-mining-v3",
+  "linkedin-greeting-workflow"
 )
 
 foreach ($name in $expectedSkills) {
@@ -72,7 +75,7 @@ if (-not $Apply) {
 }
 
 if (-not $Yes) {
-  $answer = Read-Host "Install/update these seven Skills in the listed paths? Type YES to continue"
+  $answer = Read-Host "Install/update these $($expectedSkills.Count) Skills in the listed paths? Type YES to continue"
   if ($answer -cne "YES") {
     Write-Host "Cancelled. No files changed."
     exit 1

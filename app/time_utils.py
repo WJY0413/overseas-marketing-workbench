@@ -20,6 +20,21 @@ def as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def persisted_utc(value: datetime | None) -> datetime | None:
+    """Read Workbench persisted event timestamps using their UTC storage contract.
+
+    SQLite strips timezone offsets from DateTime values.  Workbench event rows
+    have always been written from ``utc_now()``, so a legacy naive value is UTC
+    rather than an operator-local timestamp.  Keep this separate from
+    ``as_utc()``, which is for local/user-entered datetimes.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def display_dt(value: datetime | None) -> str:
     if value is None:
         return "-"

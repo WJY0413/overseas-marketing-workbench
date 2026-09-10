@@ -1,11 +1,10 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>工作台</title>
     <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   </head>
   <body>
     <main class="shell">
@@ -65,13 +64,22 @@
               <label>上次跟进晚于<input type="date" name="crm_last_after" value="{{ crm_filters.last_after }}" /></label>
               <label>国家<input name="crm_country" value="{{ crm_filters.country }}" placeholder="Thailand" /></label>
               <label>等级<input name="crm_priority" value="{{ crm_filters.priority }}" placeholder="A / B / C" /></label>
+              <label>客户库
+                <select name="crm_library">
+                  <option value="all" {% if crm_filters.library == "all" %}selected{% endif %}>全部客户库</option>
+                  <option value="terminal" {% if crm_filters.library == "terminal" %}selected{% endif %}>终端库</option>
+                  <option value="dealer" {% if crm_filters.library == "dealer" %}selected{% endif %}>Dealer 库</option>
+                </select>
+              </label>
+              <input type="hidden" name="crm_page" value="1" />
               <button class="secondary" type="submit">筛选 CRM 客户</button>
             </form>
             <form action="/draft-prep/add-from-crm" method="post">
+              <input type="hidden" name="crm_library" value="{{ crm_filters.library }}" />
               <div class="bulk-actions">
-                <label class="checkbox-line"><input type="checkbox" id="select-all-crm-candidates" /> 全选筛选结果</label>
+                <label class="checkbox-line"><input type="checkbox" id="select-all-crm-candidates" /> 全选本页</label>
                 <button type="submit">加入准备区</button>
-                <small>当前结果：{{ crm_candidate_contacts | length }} 个联系人</small>
+                <small>当前结果：{{ crm_candidate_total }} 个联系人；第 {{ crm_page }} / {{ crm_page_count }} 页（每页 10 条）</small>
               </div>
               <div class="table-wrap">
                 <table>
@@ -100,6 +108,32 @@
                 </table>
               </div>
             </form>
+            {% if crm_page_count > 1 %}
+              <div class="inline-actions">
+                {% if crm_page > 1 %}
+                  <form method="get" action="/">
+                    <input type="hidden" name="crm_followup" value="{{ crm_filters.followup }}" />
+                    <input type="hidden" name="crm_last_before" value="{{ crm_filters.last_before }}" />
+                    <input type="hidden" name="crm_last_after" value="{{ crm_filters.last_after }}" />
+                    <input type="hidden" name="crm_country" value="{{ crm_filters.country }}" />
+                    <input type="hidden" name="crm_priority" value="{{ crm_filters.priority }}" />
+                    <input type="hidden" name="crm_library" value="{{ crm_filters.library }}" />
+                    <button class="secondary" name="crm_page" value="{{ crm_page - 1 }}">上一页</button>
+                  </form>
+                {% endif %}
+                {% if crm_page < crm_page_count %}
+                  <form method="get" action="/">
+                    <input type="hidden" name="crm_followup" value="{{ crm_filters.followup }}" />
+                    <input type="hidden" name="crm_last_before" value="{{ crm_filters.last_before }}" />
+                    <input type="hidden" name="crm_last_after" value="{{ crm_filters.last_after }}" />
+                    <input type="hidden" name="crm_country" value="{{ crm_filters.country }}" />
+                    <input type="hidden" name="crm_priority" value="{{ crm_filters.priority }}" />
+                    <input type="hidden" name="crm_library" value="{{ crm_filters.library }}" />
+                    <button class="secondary" name="crm_page" value="{{ crm_page + 1 }}">下一页</button>
+                  </form>
+                {% endif %}
+              </div>
+            {% endif %}
           </details>
           <details class="template-editor">
             <summary>手动添加客户</summary>
@@ -305,7 +339,7 @@
                   <button class="start-button" type="submit" form="queue-state-action-form">{{ queue_state.button_label }}</button>
                 {% endif %}
                 <button class="secondary" type="submit" formaction="/drafts/bulk-delete" formnovalidate>删除所选草稿</button>
-                <label class="checkbox-line recent-override"><input name="force_recent_send" type="checkbox" value="true" /> 忽略 8 小时提醒</label>
+                <label class="checkbox-line recent-override"><input name="force_recent_send" type="checkbox" value="true" /> 允许 24 小时内同线程再次发送</label>
               </div>
             </div>
 
@@ -329,10 +363,10 @@
                         </form>
                       </td>
                       <td>
-                        <details class="preview">
+                        <details class="preview" data-preview-url="/drafts/{{ draft.id }}/preview">
                           <summary>查看邮件</summary>
                           {% if draft.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(draft.attachment_paths) }}</p>{% endif %}
-                          <div class="preview-body">{{ draft.body_html | safe }}</div>
+                          <div class="preview-body">展开后加载正文。</div>
                         </details>
                       </td>
                       <td>{{ display_dt(draft.approved_at) }}</td>
@@ -392,7 +426,6 @@
                     {% set company = company_by_id.get(draft.company_id) %}
                     {% set contact = contact_by_id.get(draft.contact_id) %}
                     {% set sender = senders | selectattr("id", "equalto", draft.sender_account_id) | first %}
-                    {% set preview = queue_previews.get(draft.id) %}
                     <tr>
                       <td>{% if draft.status == "queued" %}<input class="queued-draft-checkbox" type="checkbox" name="draft_ids" value="{{ draft.id }}" />{% else %}-{% endif %}</td>
                       <td><span class="badge {{ draft.status }}">{{ "已暂停" if queue_paused and draft.status == "queued" else draft.status }}</span></td>
@@ -400,12 +433,12 @@
                       <td>{{ contact.full_name if contact else "-" }}<br><small>{{ contact.email if contact else "" }}</small></td>
                       <td>{{ sender.email if sender else "-" }}</td>
                       <td>
-                        <details class="preview">
+                        <details class="preview" data-preview-url="/drafts/{{ draft.id }}/preview">
                           <summary>查看邮件</summary>
-                          <p><strong>Subject：</strong>{{ preview.subject if preview else draft.subject }}</p>
+                          <p><strong>Subject：</strong>{{ draft.subject }}</p>
                           {% if draft.cc_emails %}<p><strong>CC：</strong>{{ draft.cc_emails }}</p>{% endif %}
                           {% if draft.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(draft.attachment_paths) }}</p>{% endif %}
-                          <div class="preview-body">{{ (preview.body_html if preview else draft.body_html) | safe }}</div>
+                          <div class="preview-body">展开后加载正文。</div>
                         </details>
                       </td>
                       <td>{{ draft.error_message or "-" }}</td>
@@ -420,6 +453,20 @@
           </form>
         </section>
 
+        {% if unresolved_deliveries %}
+        <section class="panel">
+          <h2>发送结果待核验</h2>
+          <p>这些邮件可能已被接受。请核对发件箱及发送回执后再处理，系统不会自动重发。</p>
+          <table><thead><tr><th>公司</th><th>主题</th><th>状态</th><th>说明</th><th>正文</th></tr></thead><tbody>
+          {% for draft in unresolved_deliveries %}
+            <tr><td>{{ company_by_id.get(draft.company_id).name if company_by_id.get(draft.company_id) else '-' }}</td><td>{{ draft.subject }}</td>
+              <td>{{ draft.status }}</td><td>{{ draft.error_message or '发送已开始，等待结果核验' }}</td>
+              <td><details class="preview" data-preview-url="/drafts/{{ draft.id }}/preview"><summary>查看正文</summary><div class="preview-body">展开后加载正文。</div></details></td></tr>
+          {% endfor %}
+          </tbody></table>
+        </section>
+        {% endif %}
+
         <section class="panel">
           <div class="panel-head">
             <div>
@@ -427,6 +474,7 @@
               <p>变量未渲染、邮箱异常、黑名单命中或正文为空的草稿会出现在这里。</p>
             </div>
           </div>
+          <form action="/drafts/audit-pending" method="post"><button class="secondary" type="submit">检查未审核草稿</button></form>
           <form action="/drafts/bulk-approve" method="post">
             <div class="bulk-actions">
               <label class="checkbox-line"><input type="checkbox" id="select-all-exceptions" /> 全选异常草稿</label>
@@ -453,10 +501,10 @@
                         </form>
                       </td>
                       <td>
-                        <details class="preview">
+                        <details class="preview" data-preview-url="/drafts/{{ draft.id }}/preview">
                           <summary>查看正文</summary>
                           {% if draft.attachment_paths %}<p><strong>附件：</strong>{{ attachment_paths_text(draft.attachment_paths) }}</p>{% endif %}
-                          <div class="preview-body">{{ draft.body_html | safe }}</div>
+                          <div class="preview-body">展开后加载正文。</div>
                         </details>
                       </td>
                       <td>
@@ -500,6 +548,18 @@
     </dialog>
 
     <script>
+      document.querySelectorAll("details[data-preview-url]").forEach((details) => {
+        details.addEventListener("toggle", () => {
+          if (!details.open || details.dataset.loaded) return;
+          const frame = document.createElement("iframe");
+          frame.title = "邮件正文预览";
+          frame.setAttribute("sandbox", "");
+          frame.style.cssText = "width:100%;height:480px;border:0";
+          frame.src = details.dataset.previewUrl;
+          details.querySelector(".preview-body").replaceChildren(frame);
+          details.dataset.loaded = "true";
+        });
+      });
       function setAll(selector, checked) {
         document.querySelectorAll(selector).forEach((box) => { box.checked = checked; });
       }

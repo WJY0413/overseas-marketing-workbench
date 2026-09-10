@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -23,10 +24,15 @@ from app.models import (
     Suppression,
 )
 from app.time_utils import utc_now
+from app.services.suppression import suppression_matches_email
 
 
 SOURCE_SYSTEM = "BDdb"
 EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+REJECTED_OUTREACH_LOCAL_RE = re.compile(
+    r"(^|[._+-])(careers?|hire|hr|jobs?|recruit(?:ment|ing)?)([._+-]|$)",
+    re.I,
+)
 COMPANY_NO_GO_STATUSES = {
     "blacklist",
     "blacklisted",
@@ -37,7 +43,27 @@ COMPANY_NO_GO_STATUSES = {
     "suppressed",
     "unsubscribed",
 }
-CONTACT_PROTECTED_STATUSES = COMPANY_NO_GO_STATUSES | {"bounce", "bounced", "hard_bounce"}
+CONTACT_PROTECTED_STATUSES = COMPANY_NO_GO_STATUSES | {
+    "bounce",
+    "bounced",
+    "hard_bounce",
+    "bounced_email_removed",
+    "left_company",
+    "removed",
+}
+ROUTE_PROTECTED_STATUSES = {
+    "suppressed",
+    "hard_suppressed",
+    "repeat_suppressed",
+    "soft_retry",
+    "bounce",
+    "bounced",
+    "hard_bounce",
+    "bounced_email_removed",
+    "invalid",
+    "invalid_email_removed",
+    "unsubscribed",
+}
 SUCCESS_STATUSES = {"completed", "completed_with_conflicts", "unchanged"}
 FATAL_CONFLICT_TYPES = {
     "bd_company_id_reuse",
@@ -75,6 +101,15 @@ def _emails(value: object) -> list[str]:
     return list(dict.fromkeys(match.group(0).casefold() for match in EMAIL_RE.finditer(_text(value))))
 
 
+def _effective_email_send_status(value: object, email: str) -> str:
+    """Default a verified route to include, except recruitment mailboxes."""
+    explicit = _text(value).casefold()
+    if explicit:
+        return explicit
+    local_part = email.partition("@")[0]
+    return "exclude" if REJECTED_OUTREACH_LOCAL_RE.search(local_part) else "include"
+
+
 def _rank(value: object) -> int | None:
     try:
         return int(_text(value))
@@ -91,13 +126,21 @@ def _source_region(company: dict[str, Any]) -> str:
     return _text(company.get("business_region_label") or company.get("primary_business_region"))
 
 
-def _candidate_for_row(row: dict[str, Any], email: str) -> dict[str, Any]:
+def _candidate_for_row(
+    row: dict[str, Any],
+    email: str,
+    *,
+    email_send_status: str | None = None,
+) -> dict[str, Any]:
     rank = _rank(row.get("priority_contact_rank"))
-    ready = _text(row.get("priority_roll_status")).casefold() == "ready"
+    roll_status = _text(row.get("priority_roll_status")).casefold()
+    ready = roll_status == "ready"
     return {
         "email": email,
-        "full_name": _text(row.get("联系人")) or "Team",
-        "position": _text(row.get("联系人职位")) or None,
+        "full_name": _text(row.get("contact_name")) or "Team",
+        "position": _text(row.get("contact_position")) or None,
+        "email_send_status": email_send_status or _text(row.get("email_send_status")).casefold(),
+        "priority_roll_status": roll_status,
         "rank": rank,
         "ready": ready,
         "is_primary": ready and rank is not None and rank < 999,
@@ -115,7 +158,7 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, str]:
 def _prepare_source(data: dict[str, Any]) -> tuple[list[dict[str, Any]], int, list[dict[str, Any]]]:
     companies = data.get("companies")
     if not isinstance(companies, dict):
-        raise ValueError("BD source JSON must contain a companies object.")
+        raise ValueError("BD source SQLite read did not produce a companies object.")
 
     prepared: list[dict[str, Any]] = []
     rejects: list[dict[str, Any]] = []
@@ -128,7 +171,7 @@ def _prepare_source(data: dict[str, Any]) -> tuple[list[dict[str, Any]], int, li
         if not external_id or not name:
             rejects.append(
                 {
-                    "reason": "missing_company_id_or_name",
+                "reason": "missing_company_id_or_name",
                     "source_key": _text(source_key),
                     "external_company_id": external_id,
                 }
@@ -139,7 +182,7 @@ def _prepare_source(data: dict[str, Any]) -> tuple[list[dict[str, Any]], int, li
         company_no_go = _is_company_no_go(raw_company)
         qualified_candidates: dict[str, dict[str, Any]] = {}
         all_emails: set[str] = set()
-        disqualified_emails: set[str] = set()
+        disqualified_candidates: dict[str, dict[str, Any]] = {}
         rows = raw_company.get("contact_rows") or []
         if not isinstance(rows, list):
             rejects.append({"reason": "invalid_contact_rows", "external_company_id": external_id})
@@ -149,18 +192,26 @@ def _prepare_source(data: dict[str, Any]) -> tuple[list[dict[str, Any]], int, li
             if not isinstance(row, dict):
                 rejects.append({"reason": "invalid_contact_object", "external_company_id": external_id})
                 continue
-            route_emails = set(_emails(row.get("联系方式")))
+            route_emails = set(_emails(row.get("contact_route")))
             excluded_emails = set(_emails(row.get("email_excluded_addresses")))
             all_emails.update(route_emails)
             all_emails.update(excluded_emails)
-            send_status = _text(row.get("email_send_status")).casefold()
-            if company_no_go or send_status != "include":
-                disqualified_emails.update(route_emails)
-                disqualified_emails.update(excluded_emails)
-                continue
-            disqualified_emails.update(excluded_emails)
+            for email in sorted(excluded_emails):
+                disqualified_candidates[email] = _candidate_for_row(
+                    row,
+                    email,
+                    email_send_status="exclude",
+                )
             for email in sorted(route_emails - excluded_emails):
-                candidate = _candidate_for_row(row, email)
+                send_status = _effective_email_send_status(row.get("email_send_status"), email)
+                if company_no_go or send_status != "include":
+                    disqualified_candidates[email] = _candidate_for_row(
+                        row,
+                        email,
+                        email_send_status="exclude" if company_no_go else send_status,
+                    )
+                    continue
+                candidate = _candidate_for_row(row, email, email_send_status=send_status)
                 current = qualified_candidates.get(email)
                 if current is None or _candidate_sort_key(candidate) < _candidate_sort_key(current):
                     qualified_candidates[email] = candidate
@@ -175,19 +226,139 @@ def _prepare_source(data: dict[str, Any]) -> tuple[list[dict[str, Any]], int, li
                 "company_no_go": company_no_go,
                 "qualified": qualified_candidates,
                 "all_emails": all_emails,
-                "disqualified": disqualified_emails - set(qualified_candidates),
+                "disqualified": {
+                    email: candidate
+                    for email, candidate in disqualified_candidates.items()
+                    if email not in qualified_candidates
+                },
             }
         )
     return prepared, len(companies), rejects
 
 
+def _json_object(value: object, *, label: str) -> dict[str, Any]:
+    try:
+        data = json.loads(_text(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"BD source SQLite contains invalid {label} raw_json: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"BD source SQLite {label} raw_json must be an object.")
+    return data
+
+
+def _sqlite_source_data(source_path: Path) -> tuple[dict[str, Any], str, int]:
+    uri = f"file:{source_path.resolve().as_posix()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        raise OSError(f"BD source SQLite database is not readable: {source_path}: {exc}") from exc
+
+    company_columns = {
+        "company_id", "domain", "standard_company_name", "website", "country", "rating",
+        "company_type", "source", "status", "is_blacklisted", "primary_business_region",
+    }
+    contact_columns = {
+        "company_id", "row_index", "contact_name", "contact_position", "contact_route",
+        "email_send_status", "priority_roll_status", "priority_contact_rank",
+    }
+    try:
+        available_companies = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
+        available_contacts = {row[1] for row in connection.execute("PRAGMA table_info(contacts)")}
+        missing = sorted(company_columns - available_companies)
+        missing += [f"contacts.{name}" for name in sorted(contact_columns - available_contacts)]
+        if missing:
+            raise ValueError(f"BD source SQLite schema is missing columns: {', '.join(missing)}")
+
+        company_raw_select = "raw_json" if "raw_json" in available_companies else "'{}' AS raw_json"
+        contact_raw_select = "raw_json" if "raw_json" in available_contacts else "'{}' AS raw_json"
+
+        digest = hashlib.sha256()
+        companies: dict[str, dict[str, Any]] = {}
+        by_external_id: dict[str, dict[str, Any]] = {}
+        company_rows = connection.execute(
+            f"""
+            SELECT company_id, domain, standard_company_name, website, country, rating,
+                   company_type, source, status, is_blacklisted, primary_business_region,
+                   {company_raw_select}
+              FROM companies
+             ORDER BY company_id
+            """
+        )
+        for ordinal, row in enumerate(company_rows):
+            digest.update("\x1f".join(_text(row[column]) for column in row.keys()).encode("utf-8"))
+            digest.update(b"\n")
+            company_id = _text(row["company_id"])
+            company = _json_object(row["raw_json"], label=f"company {company_id or ordinal}")
+            # Explicit normalized columns are authoritative; do not inherit stale nested contacts.
+            company.update(
+                {
+                    "company_id": company_id,
+                    "domain": _text(row["domain"]),
+                    "standard_company_name": _text(row["standard_company_name"]),
+                    "website": _text(row["website"]),
+                    "country": _text(row["country"]),
+                    "rating": _text(row["rating"]),
+                    "company_type": _text(row["company_type"]),
+                    "source": _text(row["source"]),
+                    "status": _text(row["status"]),
+                    "primary_business_region": _text(row["primary_business_region"]),
+                    "blacklist": {"is_blacklisted": bool(row["is_blacklisted"])},
+                    "contact_rows": [],
+                }
+            )
+            companies[f"{company_id}\x1f{ordinal}"] = company
+            by_external_id[company_id] = company
+
+        contact_rows = connection.execute(
+            f"""
+            SELECT company_id, row_index, contact_name, contact_position, contact_route,
+                   email_send_status, priority_roll_status, priority_contact_rank,
+                   {contact_raw_select}
+              FROM contacts
+             ORDER BY company_id, row_index
+            """
+        )
+        for row in contact_rows:
+            digest.update("\x1f".join(_text(row[column]) for column in row.keys()).encode("utf-8"))
+            digest.update(b"\n")
+            company_id = _text(row["company_id"])
+            company = by_external_id.get(company_id)
+            if company is None:
+                raise ValueError(f"BD source SQLite contact references unknown company_id: {company_id}")
+            contact = _json_object(row["raw_json"], label=f"contact {company_id}/{row['row_index']}")
+            # These aliases preserve the established Workbench sync contract.
+            contact.update(
+                {
+                    "contact_name": _text(row["contact_name"]),
+                    "contact_position": _text(row["contact_position"]),
+                    "contact_route": _text(row["contact_route"]),
+                    "联系人": _text(row["contact_name"]),
+                    "联系人职位": _text(row["contact_position"]),
+                    "联系方式": _text(row["contact_route"]),
+                    "email_send_status": _text(row["email_send_status"]),
+                    "priority_roll_status": _text(row["priority_roll_status"]),
+                    "priority_contact_rank": _text(row["priority_contact_rank"]),
+                }
+            )
+            company["contact_rows"].append(contact)
+    except sqlite3.Error as exc:
+        raise ValueError(f"Unable to read BD source SQLite database: {exc}") from exc
+    finally:
+        connection.close()
+
+    return {"schema": "bddb-sqlite-v1", "companies": companies}, digest.hexdigest(), source_path.stat().st_mtime_ns
+
+
 def _load_source(source_path: Path | None) -> tuple[dict[str, Any], str, int]:
     if source_path is None:
-        raise ValueError("BD_DATABASE_JSON_PATH is not configured.")
+        raise ValueError("BD_DATABASE_SQLITE_PATH is not configured.")
     if not source_path.exists():
         raise FileNotFoundError(f"BD source path does not exist: {source_path}")
     if not source_path.is_file():
         raise ValueError(f"BD source path is not a file: {source_path}")
+    if source_path.suffix.casefold() in {".sqlite", ".db", ".sqlite3"}:
+        return _sqlite_source_data(source_path)
     try:
         payload = source_path.read_bytes()
     except OSError as exc:
@@ -195,7 +366,7 @@ def _load_source(source_path: Path | None) -> tuple[dict[str, Any], str, int]:
     try:
         data = json.loads(payload.decode("utf-8-sig"))
     except Exception as exc:
-        raise ValueError(f"Unable to parse BD source JSON: {exc}") from exc
+        raise ValueError(f"Unable to parse legacy BD source JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError("BD source JSON root must be an object.")
     return data, hashlib.sha256(payload).hexdigest(), source_path.stat().st_mtime_ns
@@ -318,11 +489,7 @@ def _sync_prepared(
 
     contacts = list(session.exec(select(Contact)))
     contacts_by_email = {_text(contact.email).casefold(): contact for contact in contacts}
-    suppressed = {
-        _text(email).casefold()
-        for email in session.exec(select(Suppression.email))
-        if _text(email)
-    }
+    suppressions = list(session.exec(select(Suppression)))
     bounced = {
         _text(email).casefold()
         for email in session.exec(select(BounceRecord.recipient_email))
@@ -379,14 +546,10 @@ def _sync_prepared(
                 )
                 continue
         else:
-            bootstrap_emails = sorted(
-                email
-                for email in source["all_emails"] - blocked_emails
-                if email in contacts_by_email
-            )
             owner_company_ids = {
                 contacts_by_email[email].company_id
-                for email in bootstrap_emails
+                for email in source["all_emails"] - blocked_emails
+                if email in contacts_by_email
             }
             if len(owner_company_ids) > 1:
                 _conflict(
@@ -395,11 +558,10 @@ def _sync_prepared(
                     external_company_id=external_id,
                     domain=source["domain"],
                     company_ids=sorted(owner_company_ids),
-                    quarantine_emails=bootstrap_emails,
                 )
                 blocked_ids.add(external_id)
                 quarantine_company_ids.add(external_id)
-                quarantine_emails.update(bootstrap_emails)
+                quarantine_emails.update(source["all_emails"] & set(contacts_by_email))
                 continue
             if len(owner_company_ids) == 1:
                 owner_id = next(iter(owner_company_ids))
@@ -410,14 +572,12 @@ def _sync_prepared(
                         "workbench_company_link_conflict",
                         external_company_id=external_id,
                         domain=source["domain"],
-                        email=bootstrap_emails[0] if len(bootstrap_emails) == 1 else None,
                         company_id=owner_id,
                         linked_external_company_id=existing_owner_link.external_company_id,
-                        quarantine_emails=bootstrap_emails,
                     )
                     blocked_ids.add(external_id)
                     quarantine_company_ids.add(external_id)
-                    quarantine_emails.update(bootstrap_emails)
+                    quarantine_emails.update(source["all_emails"] & set(contacts_by_email))
                     continue
                 company = companies_by_id.get(owner_id)
                 match_method = "email_overlap"
@@ -517,20 +677,20 @@ def _sync_prepared(
             if contact is not None and contact.company_id != company.id:
                 raise RuntimeError("preflight owner-conflict quarantine was bypassed")
 
-            route_status = (
-                "suppressed"
-                if email in suppressed or email in bounced
-                else "active" if candidate["ready"] else "inactive"
-            )
+            route_status = "suppressed" if any(
+                suppression_matches_email(item, email) for item in suppressions
+            ) or email in bounced else "active"
             if contact is None:
                 contact = Contact(
                     company_id=company.id,
                     full_name=candidate["full_name"],
                     position=candidate["position"],
                     email=email,
+                    email_send_status=candidate["email_send_status"],
+                    priority_roll_status=candidate["priority_roll_status"],
                     priority_contact_rank=candidate["rank"],
                     is_primary=candidate["is_primary"],
-                    status=route_status,
+                    status="active",
                 )
                 session.add(contact)
                 session.flush()
@@ -542,6 +702,8 @@ def _sync_prepared(
                 desired = {
                     "full_name": candidate["full_name"],
                     "position": candidate["position"],
+                    "email_send_status": candidate["email_send_status"],
+                    "priority_roll_status": candidate["priority_roll_status"],
                     "priority_contact_rank": candidate["rank"],
                     "is_primary": candidate["is_primary"],
                 }
@@ -552,11 +714,9 @@ def _sync_prepared(
                 current_contact_status = _text(contact.status).casefold()
                 if (
                     current_contact_status not in CONTACT_PROTECTED_STATUSES
-                    and email not in suppressed
-                    and email not in bounced
-                    and contact.status != route_status
+                    and contact.status != "active"
                 ):
-                    contact.status = route_status
+                    contact.status = "active"
                     contact_changed = True
                 if contact_changed:
                     contact.updated_at = now
@@ -579,25 +739,33 @@ def _sync_prepared(
                 session.add(route)
                 email_routes[route_key] = route
                 counts["inserted_routes"] += 1
-            elif _text(route.status).casefold() not in CONTACT_PROTECTED_STATUSES and route.status != route_status:
+            elif _text(route.status).casefold() not in ROUTE_PROTECTED_STATUSES and route.status != route_status:
                 route.status = route_status
                 route.updated_at = now
                 session.add(route)
 
-        for email in sorted(source["disqualified"]):
+        for email, candidate in sorted(source["disqualified"].items()):
             contact = contacts_by_email.get(email)
             if contact is None or contact.company_id != company.id:
                 continue
-            if _text(contact.status).casefold() in CONTACT_PROTECTED_STATUSES:
-                continue
-            if contact.status != "inactive":
-                contact.status = "inactive"
+            contact_changed = False
+            desired = {
+                "email_send_status": candidate["email_send_status"],
+                "priority_roll_status": candidate["priority_roll_status"],
+                "priority_contact_rank": candidate["rank"],
+                "is_primary": False,
+            }
+            for field_name, incoming in desired.items():
+                if getattr(contact, field_name) != incoming:
+                    setattr(contact, field_name, incoming)
+                    contact_changed = True
+            if contact_changed:
                 contact.updated_at = now
                 session.add(contact)
                 counts["updated_contacts"] += 1
             route = email_routes.get((contact.id, email))
-            if route is not None and _text(route.status).casefold() not in CONTACT_PROTECTED_STATUSES and route.status != "inactive":
-                route.status = "inactive"
+            if route is not None and _text(route.status).casefold() not in ROUTE_PROTECTED_STATUSES and route.status != "excluded":
+                route.status = "excluded"
                 route.updated_at = now
                 session.add(route)
 

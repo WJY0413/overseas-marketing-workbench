@@ -4,6 +4,7 @@ import json
 import mimetypes
 import re
 import smtplib
+import ssl
 from email.message import EmailMessage
 from pathlib import Path
 from uuid import uuid4
@@ -14,6 +15,7 @@ from app.config import get_settings
 from app.models import Contact, EmailDraft, SenderAccount
 from app.services.render_validation import validate_rendered_message
 from app.services.secrets import decrypt_secret
+from app.services.delivery_outcome import DeliveryUncertainError
 
 
 def parse_attachment_paths(value: str | None) -> list[str]:
@@ -184,13 +186,36 @@ def send_draft(session: Session, draft: EmailDraft, sender: SenderAccount) -> st
     _add_file_attachments(msg, draft.attachment_paths)
 
     if sender.smtp_port == 465:
-        smtp = smtplib.SMTP_SSL(sender.smtp_host, sender.smtp_port, timeout=30)
+        smtp = smtplib.SMTP_SSL(sender.smtp_host, sender.smtp_port, timeout=30, context=ssl.create_default_context())
     else:
         smtp = smtplib.SMTP(sender.smtp_host, sender.smtp_port, timeout=30)
 
-    with smtp:
-        if sender.smtp_port != 465:
-            smtp.starttls()
-        smtp.login(sender.smtp_username or sender.email, password)
-        smtp.send_message(msg)
+    delivery_started = False
+    receipt = {}
+    try:
+        with smtp:
+            if sender.smtp_port != 465:
+                smtp.starttls(context=ssl.create_default_context())
+            smtp.login(sender.smtp_username or sender.email, password)
+            delivery_started = True
+            refused = smtp.send_message(msg)
+            if refused:
+                from email.utils import getaddresses
+                recipients = [address for _, address in getaddresses([msg["To"] or "", msg["Cc"] or ""])]
+                refused_lower = {address.casefold() for address in refused}
+                receipt = {
+                    "accepted_recipients": [address for address in recipients if address.casefold() not in refused_lower],
+                    "refused_recipients": {address: [code, reason.decode(errors="replace") if isinstance(reason, bytes) else str(reason)]
+                                           for address, (code, reason) in refused.items()},
+                }
+                raise DeliveryUncertainError("Partial SMTP delivery; inspect recipient results before retrying.", receipt)
+            receipt = {"smtp_accepted": True}
+    except DeliveryUncertainError:
+        raise
+    except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPDataError):
+        raise
+    except Exception as exc:
+        if delivery_started:
+            raise DeliveryUncertainError(f"SMTP outcome requires verification: {exc}", receipt) from exc
+        raise
     return "sent"

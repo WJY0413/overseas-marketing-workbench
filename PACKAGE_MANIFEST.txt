@@ -1,10 +1,12 @@
-﻿Package: Overseas_Marketing_Workbench_v0.4.20_Production_Clean
+Package: Overseas_Marketing_Workbench_v5.03_Production_Clean
 Mode: Clean Share
-Created: 2026-08-06
+Includes sample data: True
+Includes LinkedIn sample library: False
+Includes NoGo seed library: False
+Created: 2026-09-10T16:47:32
 Includes .env: False
 Includes local data: False
 Includes saved secret key: False
-Includes bundled Workbench Skills: 7
-License: MIT
+Includes bundled Workbench Skills: 10
 
 Clean share excludes local data, reports, virtualenv, backups, internal maintenance docs, and secrets.

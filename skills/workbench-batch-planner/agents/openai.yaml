@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench Batch Planner"
+  short_description: "Plan safe BD email batches from live SQLite data"
+  default_prompt: "Use $workbench-batch-planner to produce a read-only safe batch plan from the current BD master and Workbench databases."

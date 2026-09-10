@@ -12,7 +12,7 @@ Keep the first-run flow to four checks. Show details only for failed items.
 Run:
 
 ```powershell
-python scripts/preflight_check.py --package-dir <clean-package-root>
+python "<codex-skills-root>\workbench-first-run-check\scripts\preflight_check.py" --package-dir <clean-package-root>
 ```
 
 Add `--installation <path>` for a known installation or `--search-root <path>` for a narrowly scoped search. Use `--json` only when another script needs structured output.
@@ -37,7 +37,7 @@ When the clean package contains `scripts/update_existing_workbench.ps1`, run it 
 1. **Environment**: supported Python, `start.cmd` or `start_production.cmd`, `requirements.txt`, and application files exist. If the service is already running, `/health` may be checked read-only.
 2. **Sender**: at least one active, non-placeholder SMTP sender has host, username, and a stored credential reference. Never print the credential.
 3. **Signature**: a saved signature configuration or active signature template exists and does not contain placeholder identity values.
-4. **Skills**: the seven bundled Workbench Skills exist under the configured Codex skills root with no copy/old/numbered duplicates.
+4. **Skills**: the 10 bundled Workbench Skills exist under the configured Codex skills root with no copy/old/numbered duplicates.
 
 Do not expand into campaign settings, customer imports, templates, queues, NO-GO policy, bounce processing, or test sends during first-run setup. Route those tasks to their specialist Skills after readiness is complete.
 

@@ -21,25 +21,25 @@ def main() -> int:
     if not db.exists():
         raise SystemExit(f"DB not found: {db}")
 
-    con = sqlite3.connect(db)
+    con = sqlite3.connect(db.resolve().as_uri() + ("?mode=ro" if args.dry_run else "?mode=rw"), uri=True)
     cur = con.cursor()
-    before = cur.execute("select value from appsetting where key='queue_paused'").fetchone()
+    before = cur.execute("select value from app_settings where key='queue_paused'").fetchone()
     print(f"before_queue_paused={before[0] if before else None}")
 
     if not args.dry_run:
         cur.execute(
-            "update appsetting set value='true', updated_at=datetime('now') where key='queue_paused'"
+            "update app_settings set value='true', updated_at=datetime('now') where key='queue_paused'"
         )
         if cur.rowcount == 0:
             cur.execute(
                 """
-                insert into appsetting(key, value, updated_at)
+                insert into app_settings(key, value, updated_at)
                 values('queue_paused', 'true', datetime('now'))
                 """
             )
         con.commit()
 
-    after = cur.execute("select value from appsetting where key='queue_paused'").fetchone()
+    after = cur.execute("select value from app_settings where key='queue_paused'").fetchone()
     print(f"after_queue_paused={after[0] if after else None}")
     con.close()
     return 0

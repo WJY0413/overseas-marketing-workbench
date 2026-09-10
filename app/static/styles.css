@@ -382,15 +382,19 @@ button.danger {
 }
 
 .text-link {
-  color: #0f766e;
+  color: #0758c7;
   font-size: 13px;
   font-weight: 800;
-  text-decoration: none;
+  text-decoration: underline;
 }
 
 .text-link:hover {
   text-decoration: underline;
 }
+
+.text-link.is-opened { color: #111827; font-weight: 600; text-decoration: none; }
+.linkedin-confirmed-row { color: #94a3b8; text-decoration: line-through; }
+.linkedin-confirmed-row button, .linkedin-confirmed-row a { text-decoration: none; }
 
 .table-wrap {
   overflow-x: auto;

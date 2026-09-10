@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>批次计划器</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" />
+  </head>
+  <body>
+    <main class="shell">
+      {% include "_nav.html" %}
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <h1>批次计划器</h1>
+            <p>只读预排：不会创建草稿、入队或发送。已有待审核、已批准和已入队草稿会单列为“已安排”。</p>
+            <div class="version-line"><span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span><span>版本 {{ app_version }}</span></div>
+          </div>
+          <a class="button secondary" href="/">返回工作台</a>
+        </header>
+
+        {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>执行只读计划</h2><p>仅从选定邮件客户库计算；LinkedIn 建联库不参与邮件开发。按下面持久化策略、主收件人 NO-GO/抑制规则，以及“该公司是否已成功使用同一模板”计算。</p></div></div>
+          <label>邮件开发来源
+            <select id="planner-library">
+              <option value="terminal">终端库</option>
+              <option value="dealer">Dealer / 代理库</option>
+            </select>
+          </label>
+          <button id="run-planner" type="button">运行计划</button>
+          <div id="planner-result" class="notice" hidden></div>
+          <div id="planner-preview"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>模板轮换策略</h2><p>国家与目标类型标签是硬匹配：不符合不会被计划或入队。产品标签只调整优先匹配，不能屏蔽营销。目标类型支持代理、终端、终端-高尔夫球场、终端-运动场、终端-其他；通用适用于全部。</p></div></div>
+          <div class="template-edit-list">
+            {% for row in template_rows %}
+              {% set policy = row.policy %}
+              <details class="template-editor">
+                <summary>#{{ row.template.id }} {{ row.template.name }} / 国家：{{ row.template.target_countries }} / 类型：{{ row.template.target_types }} / 产品：{{ row.template.product_tags }}{% if not policy %} / 待初始化{% endif %}</summary>
+                <form action="/planner/policies/{{ row.template.id }}" method="post" class="form-grid wide">
+                  <label>轮换范围
+                    <select name="scope">
+                      <option value="general" {% if policy and policy.scope == 'general' %}selected{% endif %}>通用</option>
+                      <option value="sports_line_marking" {% if policy and policy.scope == 'sports_line_marking' %}selected{% endif %}>运动场 / 划线机</option>
+                      <option value="manual_only" {% if policy and policy.scope == 'manual_only' %}selected{% endif %}>仅手动</option>
+                    </select>
+                  </label>
+                  <label>优先级（数字小优先）<input name="priority" type="number" min="0" value="{{ policy.priority if policy else 100 }}" /></label>
+                  <label>匹配关键词（逗号分隔；仅专业范围使用）<input name="match_keywords" value="{{ policy.match_keywords if policy and policy.match_keywords else '' }}" placeholder="sports,line marking,pitch marking" /></label>
+                  <label class="checkbox-line"><input name="is_enabled" type="checkbox" value="true" {% if policy and policy.is_enabled %}checked{% endif %} /> 允许自动轮换</label>
+                  <button type="submit">保存策略</button>
+                </form>
+              </details>
+            {% else %}
+              <div class="notice">当前没有启用的 first-touch 模板。</div>
+            {% endfor %}
+          </div>
+        </section>
+      </section>
+    </main>
+    <script>
+      const button = document.getElementById("run-planner");
+      const library = document.getElementById("planner-library");
+      const result = document.getElementById("planner-result");
+      const preview = document.getElementById("planner-preview");
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        result.hidden = false;
+        result.textContent = "正在计算只读计划…";
+        preview.innerHTML = "";
+        try {
+          const body = new FormData();
+          body.set("customer_library", library.value);
+          const response = await fetch("/api/planner/run", { method: "POST", body });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.detail || "计划器未完成");
+          const summary = data.summary;
+          const label = data.customer_library === "terminal" ? "终端库" : "Dealer / 代理库";
+          result.textContent = `${label}：已安排 ${summary.already_arranged} 家；新可入队 ${summary.newly_queueable} 家；无兼容未用模板 ${summary.no_compatible_unused_template} 家；其他排除 ${summary.excluded - summary.no_compatible_unused_template} 家。`;
+          if (summary.plan_truncated) result.textContent += ` 本次计划截取 ${summary.newly_queueable} 家，全部新可入队 ${summary.total_newly_queueable} 家。`;
+          const escapeText = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+          const rows = data.planned.slice(0, 20).map((item) => `<tr><td>${escapeText(item.company)}</td><td>${escapeText(item.recipient_email)}</td><td>#${escapeText(item.template_id)} ${escapeText(item.template_name)}</td></tr>`).join("");
+          preview.innerHTML = rows ? `<div class="table-wrap"><table><thead><tr><th>公司</th><th>主收件人</th><th>建议模板</th></tr></thead><tbody>${rows}</tbody></table></div>` : "";
+        } catch (error) {
+          result.textContent = `计划器失败：${error.message}`;
+        } finally {
+          button.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

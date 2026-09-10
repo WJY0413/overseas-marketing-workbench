@@ -10,7 +10,10 @@ from app.models import Company
 from app.time_utils import utc_now
 
 
-NO_GO_STATUSES = {"blacklist", "blacklisted", "blocked", "suppressed"}
+NO_GO_STATUSES = {
+    "blacklist", "blacklisted", "blocked", "no-go", "no_go", "nogo",
+    "paused", "replied", "suppressed", "unsubscribed",
+}
 COMPANY_HEADER_ALIASES = {
     "company",
     "company name",
@@ -32,7 +35,7 @@ def company_match_key(value: object) -> str:
 
 
 def is_no_go_company(company: Company) -> bool:
-    return (company.status or "").strip().lower() in NO_GO_STATUSES
+    return company.is_blacklisted or (company.status or "").strip().lower() in NO_GO_STATUSES
 
 
 def _decode_text(payload: bytes) -> str:

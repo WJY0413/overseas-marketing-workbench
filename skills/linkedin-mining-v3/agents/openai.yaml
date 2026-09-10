@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinkedIn Mining V3"
+  short_description: "LinkedIn mining with pacing and daily caps."
+  default_prompt: "Use $linkedin-mining-v3 to mine this LinkedIn people search with pacing and daily quota guards."
