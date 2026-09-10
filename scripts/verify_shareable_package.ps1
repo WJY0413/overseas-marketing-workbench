@@ -1,6 +1,8 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$Path
+  [string]$Path,
+  [switch]$AllowInternalSeedLibraries,
+  [switch]$PureEmpty
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,7 +39,6 @@ $forbiddenPatterns = @(
   '(^|/)\.env\.production\.example$',
   '(^|/)\.env\.test\.example$',
   '(^|/)\.venv(/|$)',
-  '(^|/)data(/|$)',
   '(^|/)reports(/|$)',
   '(^|/)output(/|$)',
   '(^|/)tests(/|$)',
@@ -59,7 +60,20 @@ $forbiddenPatterns = @(
   '\.log$'
 )
 
+if (-not $AllowInternalSeedLibraries) {
+  $forbiddenPatterns += '(^|/)data(/|$)'
+}
+if ($PureEmpty) {
+  $forbiddenPatterns += '(^|/)sample_data(/|$)'
+}
+
 foreach ($entry in $entries) {
+  if ($AllowInternalSeedLibraries -and $entry -in @(
+    'data/linkedin_people_master.sqlite',
+    'data/nogo_seed_library.sqlite'
+  )) {
+    continue
+  }
   foreach ($pattern in $forbiddenPatterns) {
     if ($entry -match $pattern) {
       $problems.Add("Clean package must not include: $entry")

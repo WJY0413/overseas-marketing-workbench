@@ -1,0 +1,4 @@
+interface:
+  display_name: "LinkedIn Greeting Workflow"
+  short_description: "Parse completed captures and save draft greetings"
+  default_prompt: "Process a completed LinkedIn mining task into my explicitly selected LinkedIn library and generate draft-only connection greetings. Do not send outreach."

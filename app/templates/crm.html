@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>客户库 CRM</title>
+    <title>{{ library_label }} CRM</title>
     <link rel="stylesheet" href="/static/styles.css?v={{ app_version }}-crm-table" />
   </head>
   <body>
@@ -12,12 +12,32 @@
       <section class="content">
         <header class="topbar">
           <div>
-            <h1>客户库 CRM</h1>
-            <p>按公司聚合客户资料，展开公司查看全量联系人，展开联系人查看全部联系方式。</p>
+            <h1>{{ library_label }} CRM</h1>
+            <p>独立 SQL 客户库；按公司聚合资料，展开公司查看联系人和全部联系方式。</p>
           </div>
           <a class="button secondary" href="/">返回发送工作台</a>
         </header>
         {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+
+        <div class="inline-actions">
+          <a class="button {% if library != 'terminal' %}secondary{% endif %}" href="/crm?library=terminal">终端库</a>
+          <a class="button {% if library != 'dealer' %}secondary{% endif %}" href="/crm?library=dealer">Dealer 库</a>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head"><div><h2>录入{{ library_label }}</h2><small>只创建 CRM 公司记录，不会加入营销准备区或触发邮件。</small></div></div>
+          <form action="/crm/companies" method="post" class="form-grid wide">
+            <input type="hidden" name="library" value="{{ library }}" />
+            <label>公司名称<input name="company" required /></label>
+            <label>国家<input name="country" /></label>
+            <label>区域<input name="region" /></label>
+            <label>官网<input name="website" type="url" /></label>
+            <label>细分类型<input name="company_type" placeholder="Golf course / Dealer" /></label>
+            <label>等级<select name="priority"><option>A</option><option selected>B</option><option>C</option></select></label>
+            <label>备注<input name="notes" /></label>
+            <button type="submit">录入{{ library_label }}</button>
+          </form>
+        </section>
 
         <section class="panel">
           <div class="panel-head">
@@ -25,7 +45,7 @@
               <h2>NO-GO 公司</h2>
               <small>整家公司禁止发送及自动跟进；公司和联系人历史记录保留。</small>
             </div>
-            <span class="badge danger">{{ no_go_company_rows|length }} 家</span>
+            <span class="badge danger">{{ no_go_count }} 家</span>
           </div>
           <form action="/crm/no-go/import" method="post" enctype="multipart/form-data" class="form-grid">
             <label>
@@ -35,11 +55,9 @@
             </label>
             <button type="submit">导入并设为 NO-GO</button>
           </form>
+          <form action="/crm/no-go/feedback" method="post"><button class="secondary" type="submit">一键反馈NO-GO增量</button><small>默认使用第一个已配置发件邮箱发送至你配置的反馈邮箱；不计入营销日发送额度。附件分开列出公司 NO-GO 与具体退信邮箱，不扩展为域名级屏蔽；不含联系人、邮件历史或凭据。</small></form>
 
-          <label>
-            搜索 NO-GO 公司
-            <input id="no-go-company-search" type="search" placeholder="输入公司名、国家或来源" />
-          </label>
+          <form method="get" action="/crm" class="form-grid"><input type="hidden" name="library" value="{{ library }}" /><label>查询 NO-GO 公司<input name="no_go_query" value="{{ no_go_query }}" placeholder="输入完整或部分公司名" /></label><button class="secondary" type="submit">查询</button></form>
           <div class="table-wrap">
             <table>
               <thead>
@@ -52,21 +70,7 @@
                   <th>更新时间</th>
                 </tr>
               </thead>
-              <tbody id="no-go-company-list">
-                {% for row in no_go_company_rows %}
-                  {% set company = row.company %}
-                  <tr data-no-go-company="{{ (company.name ~ ' ' ~ (company.country or '') ~ ' ' ~ (company.source or ''))|lower }}">
-                    <td><strong>{{ company.name }}</strong></td>
-                    <td>{{ company.country or "-" }}</td>
-                    <td>{{ company.company_type or "-" }}</td>
-                    <td>{{ row.contact_count }}</td>
-                    <td>{{ company.source or "-" }}</td>
-                    <td>{{ display_dt(company.updated_at) }}</td>
-                  </tr>
-                {% else %}
-                  <tr><td colspan="6">暂无 NO-GO 公司。</td></tr>
-                {% endfor %}
-              </tbody>
+              <tbody>{% if no_go_query %}{% for company in no_go_results %}<tr><td><strong>{{ company.name }}</strong></td><td>{{ company.country or '-' }}</td><td>{{ company.company_type or '-' }}</td><td>-</td><td>{{ company.source or '-' }}</td><td>{{ display_dt(company.updated_at) }}</td></tr>{% else %}<tr><td colspan="6">未找到匹配的 NO-GO 公司。</td></tr>{% endfor %}{% else %}<tr><td colspan="6">请输入公司名后查询。</td></tr>{% endif %}</tbody>
             </table>
           </div>
         </section>
@@ -74,7 +78,7 @@
         <section class="panel">
           <div class="panel-head">
             <h2>公司视图</h2>
-            <small>{{ company_rows|length }} 家公司 · {{ crm_contact_count }} 个联系人</small>
+            <small>共 {{ company_total }} 家公司；第 {{ page }} / {{ page_count }} 页，每页 10 家</small>
           </div>
           <div class="crm-company-list">
             <div class="crm-table-head crm-company-head">
@@ -223,21 +227,9 @@
               <p>客户库暂无公司。</p>
             {% endfor %}
           </div>
+          {% if page_count > 1 %}<div class="inline-actions">{% if page > 1 %}<a class="button secondary" href="/crm?library={{ library }}&page={{ page - 1 }}&no_go_query={{ no_go_query|urlencode }}">上一页</a>{% endif %}<span>第 {{ page }} / {{ page_count }} 页</span>{% if page < page_count %}<a class="button secondary" href="/crm?library={{ library }}&page={{ page + 1 }}&no_go_query={{ no_go_query|urlencode }}">下一页</a>{% endif %}</div>{% endif %}
         </section>
       </section>
     </main>
-    <script>
-      (() => {
-        const search = document.getElementById("no-go-company-search");
-        const rows = document.querySelectorAll("#no-go-company-list tr[data-no-go-company]");
-        if (!search) return;
-        search.addEventListener("input", () => {
-          const query = search.value.trim().toLocaleLowerCase();
-          rows.forEach((row) => {
-            row.hidden = query && !row.dataset.noGoCompany.includes(query);
-          });
-        });
-      })();
-    </script>
   </body>
 </html>

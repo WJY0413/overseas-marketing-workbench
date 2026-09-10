@@ -13,7 +13,7 @@ from pathlib import Path
 
 DEFAULT_DB = Path(r"<detected-workbench-root>\data\workbench.db")
 WRITABLE_TARGET_STATUSES = {"draft", "approved", "queued", "cancelled"}
-PROTECTED_STATUSES = {"sent", "sending"}
+PROTECTED_STATUSES = {"sent", "sending", "send_unknown"}
 
 
 def build_where(args: argparse.Namespace) -> tuple[str, list[object]]:
@@ -21,7 +21,7 @@ def build_where(args: argparse.Namespace) -> tuple[str, list[object]]:
     params: list[object] = []
     if args.ids:
         ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()]
-        clauses.append("d.id in (%s)" % ",".join("?" for _ in ids))
+        clauses.append("d.draft_id in (%s)" % ",".join("?" for _ in ids))
         params.extend(ids)
     if args.status:
         clauses.append("d.status = ?")
@@ -37,17 +37,17 @@ def build_where(args: argparse.Namespace) -> tuple[str, list[object]]:
 
 
 def print_matches(cur: sqlite3.Cursor, where: str, params: list[object], limit: int) -> None:
-    total = cur.execute(f"select count(*) from emaildraft d where {where}", params).fetchone()[0]
+    total = cur.execute(f"select count(*) from email_drafts d where {where}", params).fetchone()[0]
     print(f"matched={total}")
     print("id\tstatus\tstep\ttemplate\tsender\trecipient\tcc\tsubject")
     for row in cur.execute(
         f"""
-        select d.id, d.status, d.follow_up_step, d.template_id, d.sender_account_id,
-               c.email as recipient_email, d.cc_emails, d.subject
-        from emaildraft d
-        left join contact c on c.id = d.contact_id
+        select d.draft_id as id, d.status, d.follow_up_step, d.template_id, d.sender_account_id,
+               c.primary_email as recipient_email, d.cc_emails, d.subject
+        from email_drafts d
+        left join contacts c on c.contact_id = d.contact_id
         where {where}
-        order by d.id desc
+        order by d.draft_id desc
         limit ?
         """,
         [*params, limit],
@@ -72,12 +72,12 @@ def main() -> int:
     if not db.exists():
         raise SystemExit(f"DB not found: {db}")
 
-    con = sqlite3.connect(db)
+    con = sqlite3.connect(db.resolve().as_uri() + ("?mode=rw" if args.apply and args.action != "inspect" else "?mode=ro"), uri=True)
     cur = con.cursor()
     where, params = build_where(args)
 
     print(f"db={db}")
-    paused = cur.execute("select value from appsetting where key='queue_paused'").fetchone()
+    paused = cur.execute("select value from app_settings where key='queue_paused'").fetchone()
     print(f"queue_paused={paused[0] if paused else None}")
     print_matches(cur, where, params, args.limit)
 
@@ -86,7 +86,7 @@ def main() -> int:
         return 0
 
     protected = cur.execute(
-        f"select status, count(*) from emaildraft d where {where} group by status", params
+        f"select status, count(*) from email_drafts d where {where} group by status", params
     ).fetchall()
     protected_hit = [status for status, _ in protected if status in PROTECTED_STATUSES]
     if protected_hit:
@@ -95,10 +95,10 @@ def main() -> int:
     if args.action == "set-status":
         if not args.to_status:
             raise SystemExit("--to-status is required for set-status")
-        sql = f"update emaildraft as d set status=?, updated_at=datetime('now') where {where}"
+        sql = f"update email_drafts as d set status=?, updated_at=datetime('now') where {where}"
         write_params = [args.to_status, *params]
     elif args.action == "delete":
-        sql = f"delete from emaildraft where id in (select d.id from emaildraft d where {where})"
+        sql = f"delete from email_drafts where draft_id in (select d.draft_id from email_drafts d where {where})"
         write_params = params
     else:
         raise SystemExit(f"Unsupported action: {args.action}")

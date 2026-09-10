@@ -44,6 +44,18 @@ BLOCKED_LOCAL_PARTS = {
     "postmaster",
 }
 
+PLACEHOLDER_LOCAL_PARTS = {
+    "dummy",
+    "email",
+    "example",
+    "name",
+    "sample",
+    "test",
+    "unknown",
+    "user",
+    "yourname",
+}
+
 
 @dataclass(frozen=True)
 class EmailQualityResult:
@@ -72,6 +84,8 @@ def _domain_accepts_mail(domain: str) -> tuple[str, str]:
     try:
         mx_records = resolver.resolve(domain, "MX")
         if mx_records:
+            if any(str(getattr(record, "exchange", "")).strip() == "." or str(record).strip() == "0 ." for record in mx_records):
+                return "invalid", "Domain explicitly accepts no mail (Null MX)."
             return "valid", "Domain has MX records."
     except dns.resolver.NXDOMAIN:
         return "invalid", "Domain does not exist."
@@ -129,6 +143,8 @@ def validate_contact_email(email: str, check_deliverability: bool = True) -> Ema
         return EmailQualityResult("invalid", normalized, f"Reserved or test email domain is not deliverable: {domain}.")
     if local in BLOCKED_LOCAL_PARTS:
         return EmailQualityResult("invalid", normalized, f"System mailbox is not suitable for outbound outreach: {local}@.")
+    if local.split("+", 1)[0] in PLACEHOLDER_LOCAL_PARTS:
+        return EmailQualityResult("invalid", normalized, f"Placeholder/test email local part is not suitable for outreach: {local}@.")
 
     if not check_deliverability:
         return EmailQualityResult("valid", normalized, "Email syntax is valid.")

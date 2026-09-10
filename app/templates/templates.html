@@ -13,7 +13,7 @@
         <header class="topbar">
           <div>
             <h1>邮件模板</h1>
-            <p>新建、导入和维护邮件模板。正文编辑框支持直接从 Word 复制粘贴。</p>
+            <p>新建、导入和维护邮件模板。国家和目标类型标签是营销门槛；产品标签只用于优先匹配，不会阻止营销。</p>
             <div class="version-line">
               <span class="env-tag {{ settings.app_environment }}">{{ settings.app_instance_name }}</span>
               <span>版本 {{ app_version }}</span>
@@ -36,6 +36,9 @@
               <label>模板名称<input name="name" placeholder="默认使用 Word 文件名" /></label>
               <label>模板类型<input name="template_type" value="first_touch" /></label>
               <label>Subject<input name="subject" placeholder="Exploring smart turf management" /></label>
+              <label>国家标签<input name="target_countries" value="通用" placeholder="通用，英国，爱尔兰" /></label>
+              <label>目标类型标签<input name="target_types" value="通用" placeholder="通用，代理，终端-高尔夫球场" /></label>
+              <label>产品标签（只匹配）<input name="product_tags" value="通用" placeholder="通用，划线机，割草机" /></label>
               <label>Word 文件<input type="file" name="file" accept=".docx" required /></label>
               <button type="submit">导入 Word 模板</button>
             </form>
@@ -43,6 +46,9 @@
               <label>模板名称<input name="name" placeholder="HTML or text template" required /></label>
               <label>模板类型<input name="template_type" value="first_touch" /></label>
               <label>Subject<input name="subject" required /></label>
+              <label>国家标签<input name="target_countries" value="通用" placeholder="通用，英国，爱尔兰" /></label>
+              <label>目标类型标签<input name="target_types" value="通用" placeholder="通用，代理，终端-高尔夫球场" /></label>
+              <label>产品标签（只匹配）<input name="product_tags" value="通用" placeholder="通用，划线机，割草机" /></label>
               <label>HTML/TXT 文件<input type="file" name="file" accept=".html,.htm,.txt,.md,.markdown" required /></label>
               <button class="secondary" type="submit">导入 HTML/TXT</button>
             </form>
@@ -96,7 +102,10 @@
             <label>Subject<input name="subject" placeholder="Robotic groundcare solutions for {{ "{{ company }}" }}" required /></label>
             <label>模板类型<input name="template_type" value="first_touch" /></label>
             <details class="advanced-fields">
-              <summary>抄送与高级字段</summary>
+              <summary>目标标签、抄送与高级字段</summary>
+              <label>国家标签（逗号分隔；通用=所有国家）<input name="target_countries" value="通用" placeholder="通用，英国，爱尔兰" /></label>
+              <label>目标类型标签（逗号分隔）<input name="target_types" value="通用" placeholder="通用，代理，终端，终端-高尔夫球场，终端-运动场，终端-其他" /></label>
+              <label>产品标签（只影响匹配优先级，不屏蔽）<input name="product_tags" value="通用" placeholder="通用，划线机，割草机" /></label>
               <label>CC 邮箱<input name="cc_emails" placeholder="cc1@example.com, cc2@example.com" /></label>
               <label class="checkbox-line"><input name="cc_enabled" type="checkbox" value="true" /> 启用 CC</label>
               <label>纯文本正文<textarea name="body_text" placeholder="可选；留空时自动从正文生成"></textarea></label>
@@ -124,13 +133,16 @@
           <div class="template-edit-list">
             {% for template in templates %}
               <details class="template-editor">
-                <summary>{{ template.name }}{% if not template.is_active %} / 已停用{% endif %}</summary>
+                <summary>{{ template.name }} / 国家：{{ template.target_countries }} / 类型：{{ template.target_types }} / 产品：{{ template.product_tags }}{% if not template.is_active %} / 已停用{% endif %}</summary>
                 <form action="/templates/{{ template.id }}/settings" method="post" class="form-grid wide rich-template-form">
                   <label>模板名称<input name="name" value="{{ template.name }}" required /></label>
                   <label>Subject<input name="subject" value="{{ template.subject }}" required /></label>
                   <label>模板类型<input name="template_type" value="{{ template.template_type }}" /></label>
                   <details class="advanced-fields">
-                    <summary>抄送与高级字段</summary>
+                    <summary>目标标签、抄送与高级字段</summary>
+                    <label>国家标签（通用=所有国家）<input name="target_countries" value="{{ template.target_countries }}" placeholder="通用，英国，爱尔兰" /></label>
+                    <label>目标类型标签<input name="target_types" value="{{ template.target_types }}" placeholder="通用，代理，终端，终端-高尔夫球场，终端-运动场，终端-其他" /></label>
+                    <label>产品标签（只影响匹配优先级，不屏蔽）<input name="product_tags" value="{{ template.product_tags }}" placeholder="通用，划线机，割草机" /></label>
                     <label>CC 邮箱<input name="cc_emails" value="{{ template.cc_emails or '' }}" placeholder="cc1@example.com, cc2@example.com" /></label>
                     <label class="checkbox-line"><input name="cc_enabled" type="checkbox" value="true" {% if template.cc_enabled %}checked{% endif %} /> 启用 CC</label>
                     <label class="checkbox-line"><input name="is_active" type="checkbox" value="true" {% if template.is_active %}checked{% endif %} /> 启用模板</label>

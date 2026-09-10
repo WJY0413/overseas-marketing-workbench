@@ -1,5 +1,6 @@
-﻿import json
+import json
 import logging
+import os
 import re
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
@@ -8,20 +9,22 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import delete, func
+from sqlalchemy.orm import defer
 from sqlmodel import Session, select
 
 from app.config import get_settings
-from app.db import create_db_and_tables, engine, get_session
-from app.models import BounceRecord, Company, Contact, ContactRoute, DraftPrepItem, EmailDraft, EmailEvent, EmailTemplate, FollowUpRule, SendRecord, SenderAccount, Suppression
+from app.db import create_db_and_tables, engine, get_session, is_unified_database
+from app.models import BounceRecord, Company, Contact, ContactRoute, DraftPrepItem, EmailDraft, EmailEvent, EmailTemplate, FollowUpRule, QueueHandoffRun, SendRecord, SenderAccount, Suppression, TemplateRotationPolicy
 from app.scheduler import scheduler, start_scheduler, stop_scheduler
 from app.seed import seed_defaults
 from app.services.docx_templates import parse_docx_email_template, parse_docx_signature_html
 from app.services.importer import import_bd_json_candidates, import_contacts, is_generic_email
 from app.services.no_go_companies import (
+    NO_GO_STATUSES,
     import_no_go_companies,
     is_no_go_company,
     parse_no_go_company_file,
@@ -29,11 +32,15 @@ from app.services.no_go_companies import (
 from app.services.email_quality import validate_contact_email
 from app.services.app_settings import is_queue_paused, set_app_setting
 from app.services.bd_master_sync import get_bd_master_sync_status, run_bd_master_sync
+from app.services.followup_cadence import generate_dual_counter_followups, get_followup_cadence, save_followup_cadence
+from app.services.suppression import active_suppression_rules, email_matches_suppression_rules
 from app.services.queue import (
+    QUEUE_PROCESSING_LOCK,
     audit_draft,
     apply_audit_result,
     approve_draft,
     cancel_queued_draft,
+    create_queue_handoff,
     daily_sent_count,
     format_sender_windows,
     next_window_start,
@@ -42,7 +49,8 @@ from app.services.queue import (
     process_due_queue,
     queue_draft,
     recipient_company_domain,
-    recent_company_send_records,
+    reserve_sender_day_slot,
+    recent_duplicate_thread_send_records,
     refresh_draft_from_template,
     refresh_pending_audits,
     scan_followups,
@@ -53,6 +61,8 @@ from app.services.queue import (
 )
 from app.services.reports import export_sending_report
 from app.services.bounce_scanner import bounce_log_path, scan_bounces
+from app.services.batch_planner import build_batch_plan, ensure_rotation_policies, ensure_rotation_policy, update_rotation_policy
+from app.services.template_targeting import normalize_tag_text, template_target_issues
 from app.services.queue_state import reconcile_queue_state
 from app.services.power_awake import release_system_awake, sync_power_awake
 from app.services.sending_limits import DEFAULT_RECOMMENDED_DAILY_LIMIT, get_sending_limit_advice
@@ -74,16 +84,30 @@ from app.services.signatures import (
     signature_context,
     upsert_signature_template,
 )
+from app.services.render_validation import TemplateFieldResolutionError, validate_template_source
 from app.services.templates import render_template
+from app.services.linkedin_connections import LinkedInConnectionError, confirmed_page, confirm as confirm_linkedin_connections, list_candidates as linkedin_candidates, master_library_page, restore_mistag, today_metrics as linkedin_today_metrics
+from app.services.nogo_feedback import send_nogo_feedback
+from app.services.nogo_seed_library import import_internal_nogo_seed
 from app.time_utils import display_dt, local_now, utc_now
 from app.version import APP_VERSION
 
-app = FastAPI(title="海外营销 Workbench")
+app = FastAPI(title="BD Email Workbench")
 logger = logging.getLogger(__name__)
 templates = Jinja2Templates(directory="app/templates")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 PIXEL = b64decode("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==")
 DRAFT_GENERATE_BATCH_SIZE = 50
+CRM_CANDIDATE_PAGE_SIZE = 10
+CUSTOMER_LIBRARIES = {
+    "terminal": "终端库",
+    "dealer": "Dealer 库",
+}
+
+
+def _customer_library(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    return "terminal" if normalized == "terminal" else "dealer"
 PLACEHOLDER_SENDER_EMAIL = "your.name@example.com"
 
 
@@ -96,7 +120,7 @@ templates.env.globals["attachment_paths_text"] = attachment_paths_text
 
 def _clear_startup_workspace(session: Session) -> None:
     session.exec(delete(DraftPrepItem))
-    # EmailDraft is durable review/queue evidence. A Workbench restart must
+    # EmailDraft is durable review/queue evidence.  A Workbench restart must
     # never erase a prepared batch before the native handoff can process it.
 
 
@@ -110,16 +134,35 @@ def startup() -> None:
         _clear_startup_workspace(session)
         session.commit()
     seed_defaults()
-    try:
-        sync_result = run_bd_master_sync(engine, settings.bd_database_path)
-    except Exception as exc:
-        logger.exception("BD master startup sync raised before it could persist a failed audit run.")
+    with Session(engine) as session:
+        seed_result = import_internal_nogo_seed(session, settings.bundled_nogo_seed_library_path)
+        if any(seed_result.values()):
+            logger.info("Imported bundled internal NO-GO seed: %s", seed_result)
+        # Existing templates receive one durable policy at migration time.  The
+        # planner itself never writes or falls back to a template-ID whitelist.
+        # Startup-gate unit tests intentionally replace Session with a small
+        # lifecycle double; policy migration belongs only to a real DB session.
+        if hasattr(session, "exec"):
+            ensure_rotation_policies(session)
+        session.commit()
+    if is_unified_database() or settings.bd_database_path is None:
         sync_result = {
-            "status": "failed",
+            "status": "local_unified_database",
             "run_id": None,
-            "error": str(exc),
-            "scheduler_safe": False,
+            "error": None,
+            "scheduler_safe": True,
         }
+    else:
+        try:
+            sync_result = run_bd_master_sync(engine, settings.bd_database_path)
+        except Exception as exc:
+            logger.exception("BD master startup sync raised before it could persist a failed audit run.")
+            sync_result = {
+                "status": "failed",
+                "run_id": None,
+                "error": str(exc),
+                "scheduler_safe": False,
+            }
     if sync_result["scheduler_safe"]:
         with Session(engine) as session:
             sync_power_awake(session)
@@ -257,9 +300,17 @@ def _create_mail_template_version(
     body_text: str | None,
     cc_enabled: bool,
     cc_emails: str | None,
+    target_countries: str = "通用",
+    target_types: str = "通用",
+    product_tags: str = "通用",
     is_active: bool = True,
     replaces_template_id: int | None = None,
 ) -> EmailTemplate:
+    validate_template_source(
+        subject=subject.strip(),
+        body_html=body_html,
+        body_text=body_text,
+    )
     template = EmailTemplate(
         name=name.strip(),
         template_type=template_type,
@@ -268,11 +319,21 @@ def _create_mail_template_version(
         body_text=body_text or None,
         cc_enabled=cc_enabled,
         cc_emails=cc_emails.strip() if cc_emails and cc_emails.strip() else None,
+        target_countries=normalize_tag_text(target_countries),
+        target_types=normalize_tag_text(target_types),
+        product_tags=normalize_tag_text(product_tags),
         is_active=is_active,
     )
     session.add(template)
     session.flush()
     _deactivate_same_name_templates(session, template.id, template.name)
+    if template.template_type == "first_touch":
+        ensure_rotation_policy(session, template, replaces_template_id=replaces_template_id)
+    if replaces_template_id is not None:
+        previous = session.get(EmailTemplate, replaces_template_id)
+        if previous is not None:
+            previous.is_active = False
+            session.add(previous)
     if replaces_template_id is not None and is_active:
         rules = session.exec(
             select(FollowUpRule).where(FollowUpRule.template_id == replaces_template_id)
@@ -286,21 +347,16 @@ def _create_mail_template_version(
 
 def _dashboard_stats(session: Session) -> dict[str, int]:
     senders = session.exec(select(SenderAccount).where(SenderAccount.email != PLACEHOLDER_SENDER_EMAIL)).all()
+    counts = dict(session.exec(
+        select(EmailDraft.status, func.count(EmailDraft.id))
+        .where(EmailDraft.status.in_(["queued", "approved", "pending_review"]))
+        .group_by(EmailDraft.status)
+    ).all())
     return {
         "sent_today": sum(daily_sent_count(session, sender) for sender in senders),
-        "queued": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "queued")).one(),
-        "approved": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "approved")).one(),
-        "audit_exceptions": session.exec(
-            select(func.count(EmailDraft.id)).where(EmailDraft.status == "pending_review")
-        ).one(),
-        "failed": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "failed")).one(),
-        "skipped": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "skipped")).one(),
-        "simulated": session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "simulated")).one(),
-        "followups_due": session.exec(
-            select(func.count(Company.id)).where(Company.next_follow_up_at != None)
-        ).one(),
-        "opens": session.exec(select(func.count(EmailEvent.id)).where(EmailEvent.event_type == "open")).one(),
-        "bounces": session.exec(select(func.count(BounceRecord.id))).one(),
+        "queued": counts.get("queued", 0),
+        "approved": counts.get("approved", 0),
+        "audit_exceptions": counts.get("pending_review", 0),
     }
 
 
@@ -313,8 +369,8 @@ def _sender_usage(session: Session) -> list[dict]:
     return [
         {
             "sender": sender,
-            "sent_today": daily_sent_count(session, sender),
-            "remaining": max(sender.daily_limit - daily_sent_count(session, sender), 0),
+            "sent_today": (sent_today := daily_sent_count(session, sender)),
+            "remaining": max(sender.daily_limit - sent_today, 0),
             "advice": get_sending_limit_advice(sender),
             "send_timezone": sender_timezone(sender).key,
             "send_windows": format_sender_windows(sender),
@@ -352,27 +408,6 @@ def _sort_queue_drafts(
     return sorted(drafts, key=key, reverse=reverse)
 
 
-def _sort_send_records(
-    records: list[SendRecord],
-    company_by_id: dict[int, Company],
-    contact_by_id: dict[int, Contact],
-    sort_by: str,
-    sort_dir: str,
-) -> list[SendRecord]:
-    reverse = sort_dir != "asc"
-
-    def key(record: SendRecord):
-        company = company_by_id.get(record.company_id)
-        contact = contact_by_id.get(record.contact_id)
-        if sort_by == "company":
-            return ((company.name if company else "").lower(), record.sent_at)
-        if sort_by == "contact":
-            return ((contact.full_name if contact else "").lower(), record.sent_at)
-        return record.sent_at
-
-    return sorted(records, key=key, reverse=reverse)
-
-
 def _reschedule_sender_queue(session: Session, sender: SenderAccount) -> int:
     queued_drafts = session.exec(
         select(EmailDraft)
@@ -383,6 +418,11 @@ def _reschedule_sender_queue(session: Session, sender: SenderAccount) -> int:
         return 0
     schedule_at = next_window_start(sender)
     for draft in queued_drafts:
+        draft.scheduled_at = None
+        session.add(draft)
+    session.flush()
+    for draft in queued_drafts:
+        schedule_at = reserve_sender_day_slot(session, sender, schedule_at, exclude_draft_id=draft.id)
         draft.scheduled_at = schedule_at
         draft.updated_at = utc_now()
         session.add(draft)
@@ -426,6 +466,18 @@ def _add_draft_prep_contacts(session: Session, contact_ids: list[int]) -> int:
     return added
 
 
+def _customer_libraries_for_contacts(session: Session, contact_ids: list[int]) -> set[str]:
+    libraries: set[str] = set()
+    for contact_id in set(contact_ids):
+        contact = session.get(Contact, contact_id)
+        if contact is None:
+            continue
+        company = session.get(Company, contact.company_id)
+        if company is not None:
+            libraries.add(_customer_library(company.customer_library))
+    return libraries
+
+
 def _contact_send_rank(contact: Contact) -> tuple[int, int, int]:
     rank = contact.priority_contact_rank if contact.priority_contact_rank is not None else 9999
     generic_penalty = 1 if _is_cc_contact(contact) else 0
@@ -435,7 +487,7 @@ def _contact_send_rank(contact: Contact) -> tuple[int, int, int]:
 
 def _is_cc_contact(contact: Contact) -> bool:
     label = f"{contact.full_name or ''} {contact.position or ''}".lower()
-    return is_generic_email(contact.email) or "team" in label or "general inbox" in label or "public inbox" in label or " cc" in f" {label}"
+    return is_generic_email(contact.email or "") or "team" in label or "general inbox" in label or "public inbox" in label or " cc" in f" {label}"
 
 
 def _preferred_contact_for_company(contacts: list[Contact]) -> Contact:
@@ -498,15 +550,21 @@ def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, con
         if company is None or company.status in {"replied", "unsubscribed", "paused", "blacklisted"}:
             stats["skipped"] += 1
             continue
-        cc_emails = _company_cc_emails(session, company.id, contact)
+        if template_target_issues(template, company):
+            stats["skipped"] += 1
+            continue
+        cc_emails = _company_cc_emails(session, company.id, contact) if template.cc_enabled else None
         existing = session.exec(
             select(EmailDraft).where(
                 EmailDraft.company_id == company.id,
-                EmailDraft.status.in_(["pending_review", "approved", "queued"]),
+                EmailDraft.status.in_(["pending_review", "approved", "queued", "sending", "send_unknown"]),
                 EmailDraft.follow_up_step == 0,
             )
         ).first()
         if existing:
+            if existing.status in {"sending", "send_unknown"}:
+                stats["skipped"] += 1
+                continue
             original_status = existing.status
             refreshed_existing = False
             try:
@@ -611,12 +669,10 @@ def _crm_candidate_contacts(
     last_after: str,
     country: str,
     priority: str,
+    customer_library: str,
 ) -> list[Contact]:
     company_by_id = {company.id: company for company in companies}
-    suppressions = {
-        suppression.email
-        for suppression in session.exec(select(Suppression)).all()
-    }
+    suppression_rules = active_suppression_rules(session.exec(select(Suppression)).all())
     before_dt = _parse_filter_date(last_before, end_of_day=True)
     after_dt = _parse_filter_date(last_after)
     country_value = country.strip().lower()
@@ -626,9 +682,14 @@ def _crm_candidate_contacts(
         company = company_by_id.get(contact.company_id)
         if contact.status != "active" or company is None:
             continue
-        if contact.email.strip().lower() in suppressions:
+        contact_email = (contact.email or "").strip().lower()
+        if not contact_email:
+            continue
+        if email_matches_suppression_rules(suppression_rules, contact_email):
             continue
         if company.status in {"unsubscribed", "paused", "blacklisted"}:
+            continue
+        if customer_library != "all" and _customer_library(company.customer_library) != customer_library:
             continue
         if country_value and (company.country or "").strip().lower() != country_value:
             continue
@@ -822,23 +883,34 @@ def index(
     crm_last_after: str = "",
     crm_country: str = "",
     crm_priority: str = "",
+    crm_library: str = "all",
+    crm_page: int = 1,
     session: Session = Depends(get_session),
 ):
-    refresh_pending_audits(session)
     companies = session.exec(select(Company).order_by(Company.updated_at.desc())).all()
-    contacts = session.exec(select(Contact).order_by(Contact.created_at.desc())).all()
-    routes_by_contact = _routes_by_contact(session, [contact.id for contact in contacts if contact.id is not None])
+    # The unified database retains all raw BD contact rows, including rows that
+    # have no sendable email. The dashboard only needs email-bearing contacts;
+    # filtering them in SQL avoids rendering thousands of non-actionable rows.
+    contacts = session.exec(
+        select(Contact)
+        .where(Contact.email.is_not(None), Contact.email != "")
+        .order_by(Contact.created_at.desc())
+    ).all()
     approved_drafts = session.exec(
-        select(EmailDraft).where(EmailDraft.status == "approved").order_by(EmailDraft.approved_at.desc()).limit(250)
+        select(EmailDraft).options(defer(EmailDraft.body_html), defer(EmailDraft.body_text), defer(EmailDraft.template_snapshot)).where(EmailDraft.status == "approved").order_by(EmailDraft.approved_at.desc()).limit(250)
     ).all()
     exception_drafts = session.exec(
-        select(EmailDraft)
+        select(EmailDraft).options(defer(EmailDraft.body_html), defer(EmailDraft.body_text), defer(EmailDraft.template_snapshot))
         .where(EmailDraft.status == "pending_review")
         .order_by(EmailDraft.updated_at.desc())
-        .limit(250)
+        .limit(10)
+    ).all()
+    unresolved_deliveries = session.exec(
+        select(EmailDraft).options(defer(EmailDraft.body_html), defer(EmailDraft.body_text), defer(EmailDraft.template_snapshot))
+        .where(EmailDraft.status.in_(("sending", "send_unknown"))).order_by(EmailDraft.updated_at.desc())
     ).all()
     queue_drafts = session.exec(
-        select(EmailDraft).where(EmailDraft.status == "queued").order_by(EmailDraft.scheduled_at).limit(250)
+        select(EmailDraft).options(defer(EmailDraft.body_html), defer(EmailDraft.body_text), defer(EmailDraft.template_snapshot)).where(EmailDraft.status == "queued").order_by(EmailDraft.scheduled_at).limit(250)
     ).all()
     senders = session.exec(
         select(SenderAccount)
@@ -854,26 +926,9 @@ def index(
     contact_by_id = {contact.id: contact for contact in contacts}
     sender_by_id = {sender.id: sender for sender in senders}
     template_by_id = {template.id: template for template in email_templates}
-    queue_previews: dict[int, dict[str, str]] = {}
-    for draft in queue_drafts:
-        preview = {"subject": draft.subject, "body_html": draft.body_html}
-        company = company_by_id.get(draft.company_id)
-        contact = contact_by_id.get(draft.contact_id)
-        sender = sender_by_id.get(draft.sender_account_id)
-        template = template_by_id.get(draft.template_id)
-        if company and contact and sender and template:
-            try:
-                subject, body_html, _, _ = render_template(template, company, contact, session=session, sender=sender)
-                preview = {"subject": subject, "body_html": body_html}
-            except Exception:
-                pass
-        queue_previews[draft.id] = preview
     queue_drafts = _sort_queue_drafts(queue_drafts, company_by_id, contact_by_id, queue_sort, queue_dir)
     queue_state = reconcile_queue_state(session)
     queue_paused = queue_state["is_paused"]
-    send_records = session.exec(select(SendRecord).order_by(SendRecord.sent_at.desc()).limit(200)).all()
-    send_records = _sort_send_records(send_records, company_by_id, contact_by_id, queue_sort, queue_dir)
-    sent_count = session.exec(select(func.count(SendRecord.id))).one()
     prep_items = session.exec(select(DraftPrepItem).order_by(DraftPrepItem.created_at.desc())).all()
     prep_contact_ids = [item.contact_id for item in prep_items]
     draftable_contacts = [
@@ -883,7 +938,8 @@ def index(
         and contact.status == "active"
         and company_by_id.get(contact.company_id) is not None
     ]
-    crm_candidate_contacts = _crm_candidate_contacts(
+    crm_library = crm_library if crm_library in {*CUSTOMER_LIBRARIES, "all"} else "all"
+    all_crm_candidate_contacts = _crm_candidate_contacts(
         session,
         companies,
         contacts,
@@ -892,7 +948,13 @@ def index(
         crm_last_after,
         crm_country,
         crm_priority,
+        crm_library,
     )
+    crm_candidate_total = len(all_crm_candidate_contacts)
+    crm_page_count = max(1, (crm_candidate_total + CRM_CANDIDATE_PAGE_SIZE - 1) // CRM_CANDIDATE_PAGE_SIZE)
+    crm_page = min(max(1, crm_page), crm_page_count)
+    crm_page_start = (crm_page - 1) * CRM_CANDIDATE_PAGE_SIZE
+    crm_candidate_contacts = all_crm_candidate_contacts[crm_page_start : crm_page_start + CRM_CANDIDATE_PAGE_SIZE]
     return templates.TemplateResponse(
         "index.html",
         {
@@ -900,43 +962,54 @@ def index(
             "settings": get_settings(),
             "app_version": APP_VERSION,
             "message": message,
-            "companies": companies,
-            "contacts": contacts,
-            "routes_by_contact": routes_by_contact,
             "draftable_contacts": draftable_contacts,
-            "drafts": approved_drafts + exception_drafts + queue_drafts,
             "approved_drafts": approved_drafts,
             "exception_drafts": exception_drafts,
+            "unresolved_deliveries": unresolved_deliveries,
             "queue_drafts": queue_drafts,
-            "queue_previews": queue_previews,
             "queue_paused": queue_paused,
-            "has_queued_drafts": queue_state["has_queue"],
             "queue_state": queue_state,
             "crm_candidate_contacts": crm_candidate_contacts,
+            "crm_candidate_total": crm_candidate_total,
+            "crm_page": crm_page,
+            "crm_page_count": crm_page_count,
             "crm_filters": {
                 "followup": crm_followup,
                 "last_before": crm_last_before,
                 "last_after": crm_last_after,
                 "country": crm_country,
                 "priority": crm_priority,
+                "library": crm_library,
             },
-            "send_records": send_records,
-            "sent_count": sent_count,
             "queue_sort": queue_sort,
             "queue_dir": queue_dir,
             "queue_view": queue_view,
             "senders": senders,
-            "sender_usage": _sender_usage(session),
-            "templates": email_templates,
             "active_templates": active_templates,
             "company_by_id": company_by_id,
             "contact_by_id": contact_by_id,
             "stats": _dashboard_stats(session),
-            "default_recommended_daily_limit": DEFAULT_RECOMMENDED_DAILY_LIMIT,
             "display_dt": display_dt,
             "server_now": local_now(),
         },
     )
+
+
+@app.get("/drafts/{draft_id}/preview")
+def saved_draft_preview(draft_id: int, session: Session = Depends(get_session)):
+    body = session.exec(select(EmailDraft.body_html).where(EmailDraft.id == draft_id)).first()
+    if body is None:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    return Response(content=body, media_type="text/html", headers={
+        "Content-Security-Policy": "sandbox; default-src 'none'; img-src data: http: https:; style-src 'unsafe-inline'",
+        "Cache-Control": "no-store",
+    })
+
+
+@app.post("/drafts/audit-pending")
+def audit_pending_drafts(session: Session = Depends(get_session)):
+    refresh_pending_audits(session)
+    return _redirect("未审核草稿检查完成。")
 
 
 @app.get("/signature/preview")
@@ -975,7 +1048,6 @@ def senders_page(request: Request, message: str = "", session: Session = Depends
             "app_version": APP_VERSION,
             "message": message,
             "sender_usage": _sender_usage(session),
-            "stats": _dashboard_stats(session),
             "default_recommended_daily_limit": DEFAULT_RECOMMENDED_DAILY_LIMIT,
         },
     )
@@ -1011,7 +1083,6 @@ def send_records_page(request: Request, message: str = "", session: Session = De
             "company_by_id": {company.id: company for company in companies},
             "contact_by_id": {contact.id: contact for contact in contacts},
             "template_by_id": {template.id: template for template in email_templates},
-            "stats": _dashboard_stats(session),
             "display_dt": display_dt,
         },
     )
@@ -1044,7 +1115,11 @@ def download_bounce_log():
 def update_send_mode(dry_run_email: str = Form("true")):
     if dry_run_email not in {"true", "false"}:
         return _redirect("Invalid send mode.")
+    if "DRY_RUN_EMAIL" in os.environ and get_settings().dry_run_email != (dry_run_email == "true"):
+        return _redirect_to("/settings", "发送模式由启动环境变量固定，本次未切换。请修改启动配置后重启对应实例。")
     _update_env_value("DRY_RUN_EMAIL", dry_run_email)
+    if get_settings().dry_run_email != (dry_run_email == "true"):
+        return _redirect_to("/settings", "发送模式未生效，请检查启动配置。")
     mode = "演练模式" if dry_run_email == "true" else "真实发送模式"
     return _redirect_to("/settings", f"发送模式已切换为：{mode}")
 
@@ -1062,7 +1137,6 @@ def settings_page(request: Request, message: str = "", session: Session = Depend
             "app_version": APP_VERSION,
             "message": message,
             "sender_usage": _sender_usage(session),
-            "stats": _dashboard_stats(session),
             "default_recommended_daily_limit": DEFAULT_RECOMMENDED_DAILY_LIMIT,
             "queue_paused": is_queue_paused(session),
             "signature": _signature_form(signature_config),
@@ -1130,14 +1204,88 @@ async def import_signature_docx(file: UploadFile, session: Session = Depends(get
     return _redirect_to("/settings", "Signature DOCX imported into the shared template store. Review the signature block before sending.")
 
 
+@app.get("/linkedin-connections")
+def linkedin_connections_page(request: Request, message: str = "", query: str = "", batch_size: int = 10, page: int = 1):
+    settings = get_settings()
+    try:
+        candidates = linkedin_candidates(settings.linkedin_master_path, query=query, batch_size=batch_size)
+        metrics = linkedin_today_metrics(settings.linkedin_master_path)
+        confirmed_data = confirmed_page(settings.linkedin_master_path, query=query, page=page)
+    except LinkedInConnectionError as exc:
+        candidates, metrics, confirmed_data, message = [], {"people": 0, "batches": 0}, {"records": [], "total": 0, "page": 1, "page_count": 1}, str(exc)
+    return templates.TemplateResponse("linkedin_connections.html", {"request": request, "app_version": APP_VERSION, "message": message, "query": query, "batch_size": batch_size, "candidates": candidates, "metrics": metrics, "confirmed": confirmed_data["records"], "confirmed_total": confirmed_data["total"], "confirmed_page": confirmed_data["page"], "confirmed_page_count": confirmed_data["page_count"]})
+
+
+@app.get("/linkedin-library")
+def linkedin_library_page(request: Request, query: str = "", page: int = 1):
+    try:
+        library = master_library_page(get_settings().linkedin_master_path, query=query, page=page)
+        message = ""
+    except LinkedInConnectionError as exc:
+        library, message = {"records": [], "total": 0, "page": 1, "page_count": 1}, str(exc)
+    return templates.TemplateResponse(
+        "linkedin_library.html",
+        {"request": request, "app_version": APP_VERSION, "query": query, "message": message,
+         "records": library["records"], "total": library["total"], "page": library["page"], "page_count": library["page_count"]},
+    )
+
+
+@app.post("/linkedin-connections/confirm")
+def confirm_linkedin_connection_batch(request: Request, source_record_ids: list[str] = Form(default=[]), batch_size: int = Form(10)):
+    mode = "single" if len(source_record_ids) == 1 else "batch"
+    try:
+        result = confirm_linkedin_connections(get_settings().linkedin_master_path, source_record_ids, mode=mode, backup_dir=get_settings().data_dir / "linkedin_backups")
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "changed": result["changed"], "mode": mode, "metrics": linkedin_today_metrics(get_settings().linkedin_master_path)})
+        return _redirect_to("/linkedin-connections", f"Confirmed {len(result['changed'])} LinkedIn connection record(s).")
+    except LinkedInConnectionError as exc:
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return _redirect_to(f"/linkedin-connections?batch_size={batch_size}", str(exc))
+
+
+@app.post("/linkedin-connections/{source_record_id}/restore")
+def restore_linkedin_mistag(source_record_id: str, request: Request):
+    try:
+        restore_mistag(get_settings().linkedin_master_path, source_record_id)
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "source_record_id": source_record_id, "metrics": linkedin_today_metrics(get_settings().linkedin_master_path)})
+        return _redirect_to("/linkedin-connections", "LinkedIn mistag restored.")
+    except LinkedInConnectionError as exc:
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return _redirect_to("/linkedin-connections", str(exc))
+
+
 @app.get("/crm")
-def crm_page(request: Request, message: str = "", session: Session = Depends(get_session)):
-    companies = session.exec(select(Company).order_by(Company.updated_at.desc())).all()
-    contacts = session.exec(select(Contact).order_by(Contact.created_at.desc())).all()
+def crm_page(
+    request: Request,
+    message: str = "",
+    page: int = 1,
+    no_go_query: str = "",
+    library: str = "terminal",
+    session: Session = Depends(get_session),
+):
+    library = _customer_library(library)
+    no_go_status = func.lower(func.coalesce(Company.status, "")).in_(NO_GO_STATUSES)
+    active_filter = (
+        (Company.is_blacklisted == False)
+        & ~no_go_status
+        & ((func.lower(func.trim(func.coalesce(Company.customer_library, ""))) == "terminal")
+           if library == "terminal" else
+           (func.lower(func.trim(func.coalesce(Company.customer_library, ""))) != "terminal"))
+    )
+    no_go_filter = (Company.is_blacklisted == True) | no_go_status
+    company_total = int(session.exec(select(func.count()).select_from(Company).where(active_filter)).one())
+    page_count = max(1, (company_total + 9) // 10)
+    page = min(max(page, 1), page_count)
+    companies = session.exec(select(Company).where(active_filter).order_by(Company.updated_at.desc()).offset((page - 1) * 10).limit(10)).all()
+    company_ids = [company.id for company in companies]
+    contacts = session.exec(select(Contact).where(Contact.company_id.in_(company_ids)).order_by(Contact.created_at.desc())).all() if company_ids else []
     routes_by_contact = _routes_by_contact(session, [contact.id for contact in contacts if contact.id is not None])
     all_company_rows = _crm_company_rows(companies, contacts, routes_by_contact)
-    company_rows = [row for row in all_company_rows if not is_no_go_company(row["company"])]
-    no_go_company_rows = [row for row in all_company_rows if is_no_go_company(row["company"])]
+    company_rows = all_company_rows
+    no_go_count = int(session.exec(select(func.count()).select_from(Company).where(no_go_filter)).one())
+    no_go_results = []
+    if no_go_query.strip():
+        needle = f"%{no_go_query.strip()}%"
+        no_go_results = session.exec(select(Company).where(no_go_filter).where(Company.name.ilike(needle)).order_by(Company.updated_at.desc()).limit(10)).all()
     return templates.TemplateResponse(
         "crm.html",
         {
@@ -1149,12 +1297,57 @@ def crm_page(request: Request, message: str = "", session: Session = Depends(get
             "contacts": contacts,
             "company_rows": company_rows,
             "crm_contact_count": sum(row["contact_count"] for row in company_rows),
-            "no_go_company_rows": no_go_company_rows,
+            "company_total": company_total,
+            "library": library,
+            "library_label": CUSTOMER_LIBRARIES[library],
+            "page": page,
+            "page_count": page_count,
+            "no_go_count": no_go_count,
+            "no_go_query": no_go_query,
+            "no_go_results": no_go_results,
             "routes_by_contact": routes_by_contact,
-            "stats": _dashboard_stats(session),
             "display_dt": display_dt,
         },
     )
+
+
+@app.post("/crm/companies")
+def create_crm_company(
+    library: str = Form(...),
+    company: str = Form(...),
+    country: str = Form(""),
+    region: str = Form(""),
+    website: str = Form(""),
+    company_type: str = Form(""),
+    priority: str = Form("B"),
+    notes: str = Form(""),
+    session: Session = Depends(get_session),
+):
+    customer_library = _customer_library(library)
+    company_name = company.strip()
+    if not company_name:
+        return _redirect_to(f"/crm?library={customer_library}", "公司名称不能为空。")
+    existing = session.exec(select(Company).where(Company.name == company_name)).first()
+    if existing is not None:
+        return _redirect_to(
+            f"/crm?library={_customer_library(existing.customer_library)}",
+            f"CRM 已有公司：{existing.name}；未改变其所属客户库。",
+        )
+    record = Company(
+        name=company_name,
+        customer_library=customer_library,
+        country=country.strip() or None,
+        region=region.strip() or None,
+        website=website.strip() or None,
+        company_type=company_type.strip() or None,
+        priority=priority.strip() or "B",
+        notes=notes.strip() or None,
+        source="CRM manual entry",
+        status="new",
+    )
+    session.add(record)
+    session.commit()
+    return _redirect_to(f"/crm?library={customer_library}", f"已录入{CUSTOMER_LIBRARIES[customer_library]}：{company_name}。")
 
 
 @app.post("/crm/no-go/import")
@@ -1184,6 +1377,15 @@ async def import_no_go_company_list(
     )
 
 
+@app.post("/crm/no-go/feedback")
+def send_no_go_feedback(session: Session = Depends(get_session)):
+    try:
+        result = send_nogo_feedback(session)
+    except ValueError as exc:
+        return _redirect_to("/crm", str(exc))
+    return _redirect_to("/crm", f"NO-GO 反馈已{ '演练生成' if result['status'] == 'dry_run' else '发送' }：{result['count']} 条；默认第一发件邮箱 {result['sender']}。不计入营销日额度。")
+
+
 @app.get("/rules")
 def rules_page(request: Request, message: str = "", session: Session = Depends(get_session)):
     rules = session.exec(select(FollowUpRule).order_by(FollowUpRule.delay_days)).all()
@@ -1198,8 +1400,8 @@ def rules_page(request: Request, message: str = "", session: Session = Depends(g
             "app_version": APP_VERSION,
             "message": message,
             "rules": rules,
+            "cadence": get_followup_cadence(session),
             "templates": email_templates,
-            "stats": _dashboard_stats(session),
         },
     )
 
@@ -1215,7 +1417,6 @@ def compliance_page(request: Request, message: str = "", session: Session = Depe
             "app_version": APP_VERSION,
             "message": message,
             "suppressions": suppressions,
-            "stats": _dashboard_stats(session),
             "display_dt": display_dt,
         },
     )
@@ -1277,9 +1478,23 @@ def remove_draft_prep_contact(contact_id: int, session: Session = Depends(get_se
 
 
 @app.post("/draft-prep/add-from-crm")
-def add_draft_prep_from_crm(contact_ids: list[int] = Form(default=[]), session: Session = Depends(get_session)):
+def add_draft_prep_from_crm(
+    contact_ids: list[int] = Form(default=[]),
+    crm_library: str = Form("all"),
+    session: Session = Depends(get_session),
+):
     if not contact_ids:
         return _redirect("Please select at least one CRM contact.")
+    selected_libraries = _customer_libraries_for_contacts(session, contact_ids)
+    existing_libraries = _customer_libraries_for_contacts(
+        session,
+        [item.contact_id for item in session.exec(select(DraftPrepItem)).all()],
+    )
+    requested_library = crm_library if crm_library in CUSTOMER_LIBRARIES else "all"
+    if len(selected_libraries) != 1 or (requested_library != "all" and selected_libraries != {requested_library}):
+        return _redirect("CRM selection must contain contacts from exactly one customer library.")
+    if existing_libraries and existing_libraries != selected_libraries:
+        return _redirect("Draft prep already contains another customer library. Clear or finish it before switching campaigns.")
     added = _add_draft_prep_contacts(session, contact_ids)
     return _redirect(f"Added {added} CRM contact(s) to draft prep.")
 
@@ -1365,6 +1580,12 @@ def update_draft_prep_contact(
     if existing:
         return _redirect("Another CRM contact already uses this email.")
     company_name = company.strip()
+    previous_company = session.get(Company, contact.company_id)
+    if previous_company and previous_company.name != company_name:
+        has_history = session.exec(select(EmailDraft.id).where(EmailDraft.contact_id == contact.id).limit(1)).first() is not None
+        has_history = has_history or session.exec(select(SendRecord.id).where(SendRecord.contact_id == contact.id).limit(1)).first() is not None
+        if has_history:
+            return _redirect("Contact has draft/send history; resolve company reassignment separately.")
     if not company_name or not full_name.strip():
         return _redirect("Company and contact name are required.")
     company_record = session.exec(select(Company).where(Company.name == company_name)).first()
@@ -1408,9 +1629,73 @@ def templates_page(request: Request, message: str = "", session: Session = Depen
             "templates": email_templates,
             "signature_template": signature_template,
             "default_signature_template_name": DEFAULT_SIGNATURE_TEMPLATE_NAME,
-            "stats": _dashboard_stats(session),
         },
     )
+
+
+@app.get("/planner")
+def planner_page(request: Request, message: str = "", session: Session = Depends(get_session)):
+    first_touch_templates = session.exec(
+        select(EmailTemplate)
+        .where(EmailTemplate.template_type == "first_touch", EmailTemplate.is_active == True)
+        .order_by(EmailTemplate.name)
+    ).all()
+    policies = {
+        policy.template_id: policy
+        for policy in session.exec(select(TemplateRotationPolicy)).all()
+    }
+    return templates.TemplateResponse(
+        "planner.html",
+        {
+            "request": request,
+            "settings": get_settings(),
+            "app_version": APP_VERSION,
+            "message": message,
+            "template_rows": [
+                {"template": template, "policy": policies.get(template.id)}
+                for template in first_touch_templates
+            ],
+        },
+    )
+
+
+@app.post("/planner/policies/{template_id}")
+def save_planner_policy(
+    template_id: int,
+    scope: str = Form("general"),
+    match_keywords: str = Form(""),
+    priority: int = Form(100),
+    is_enabled: bool = Form(False),
+    session: Session = Depends(get_session),
+):
+    try:
+        update_rotation_policy(
+            session,
+            template_id,
+            scope=scope,
+            match_keywords=match_keywords,
+            priority=priority,
+            is_enabled=is_enabled,
+        )
+    except ValueError as exc:
+        return _redirect_to("/planner", str(exc))
+    session.commit()
+    return _redirect_to("/planner", "模板轮换策略已保存。")
+
+
+@app.post("/api/planner/run")
+def run_integrated_planner(
+    customer_library: str = Form(""),
+    limit: int = Form(5000),
+    session: Session = Depends(get_session),
+):
+    """Read-only planning endpoint; it cannot create a draft, queue item, or send."""
+    bounded_limit = max(1, min(limit, 5000))
+    try:
+        plan = build_batch_plan(session, customer_library=customer_library, limit=bounded_limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return JSONResponse(plan)
 
 
 @app.post("/templates")
@@ -1422,20 +1707,29 @@ def create_template(
     body_text: str = Form(""),
     cc_enabled: bool = Form(False),
     cc_emails: str = Form(""),
+    target_countries: str = Form("通用"),
+    target_types: str = Form("通用"),
+    product_tags: str = Form("通用"),
     session: Session = Depends(get_session),
 ):
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    _create_mail_template_version(
-        session,
-        name=name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=cc_enabled,
-        cc_emails=cc_emails,
-    )
+    try:
+        _create_mail_template_version(
+            session,
+            name=name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=cc_enabled,
+            cc_emails=cc_emails,
+            target_countries=target_countries,
+            target_types=target_types,
+            product_tags=product_tags,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to("/templates", "Template version saved with a new immutable ID.")
 
@@ -1492,6 +1786,9 @@ def update_template(
     body_text: str = Form(""),
     cc_enabled: bool = Form(False),
     cc_emails: str = Form(""),
+    target_countries: str = Form("通用"),
+    target_types: str = Form("通用"),
+    product_tags: str = Form("通用"),
     is_active: bool = Form(False),
     session: Session = Depends(get_session),
 ):
@@ -1500,18 +1797,24 @@ def update_template(
         return _redirect_to("/templates", "Template not found.")
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    new_template = _create_mail_template_version(
-        session,
-        name=name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=cc_enabled,
-        cc_emails=cc_emails,
-        is_active=is_active,
-        replaces_template_id=template.id,
-    )
+    try:
+        new_template = _create_mail_template_version(
+            session,
+            name=name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=cc_enabled,
+            cc_emails=cc_emails,
+            target_countries=target_countries,
+            target_types=target_types,
+            product_tags=product_tags,
+            is_active=is_active,
+            replaces_template_id=template.id,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to(
         "/templates",
@@ -1557,6 +1860,9 @@ async def import_template_file(
     template_type: str = Form("first_touch"),
     subject: str = Form(...),
     body_text: str = Form(""),
+    target_countries: str = Form("通用"),
+    target_types: str = Form("通用"),
+    product_tags: str = Form("通用"),
     session: Session = Depends(get_session),
 ):
     payload = await file.read()
@@ -1568,16 +1874,22 @@ async def import_template_file(
         return _redirect_to("/templates", "Template file is empty.")
     body_html = _normalize_template_body(body_html)
     body_text = body_text or _html_to_text(body_html)
-    _create_mail_template_version(
-        session,
-        name=name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=False,
-        cc_emails=None,
-    )
+    try:
+        _create_mail_template_version(
+            session,
+            name=name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=False,
+            cc_emails=None,
+            target_countries=target_countries,
+            target_types=target_types,
+            product_tags=product_tags,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to("/templates", "Template imported as a new immutable version.")
 
@@ -1588,6 +1900,9 @@ async def import_docx_template_file(
     name: str = Form(""),
     template_type: str = Form("first_touch"),
     subject: str = Form(""),
+    target_countries: str = Form("通用"),
+    target_types: str = Form("通用"),
+    product_tags: str = Form("通用"),
     session: Session = Depends(get_session),
 ):
     if not (file.filename or "").lower().endswith(".docx"):
@@ -1600,16 +1915,22 @@ async def import_docx_template_file(
         subject, body_html, body_text = parse_docx_email_template(payload, fallback_subject=subject)
     except ValueError as exc:
         return _redirect_to("/templates", str(exc))
-    _create_mail_template_version(
-        session,
-        name=template_name,
-        template_type=template_type,
-        subject=subject,
-        body_html=body_html,
-        body_text=body_text,
-        cc_enabled=False,
-        cc_emails=None,
-    )
+    try:
+        _create_mail_template_version(
+            session,
+            name=template_name,
+            template_type=template_type,
+            subject=subject,
+            body_html=body_html,
+            body_text=body_text,
+            cc_enabled=False,
+            cc_emails=None,
+            target_countries=target_countries,
+            target_types=target_types,
+            product_tags=product_tags,
+        )
+    except TemplateFieldResolutionError as exc:
+        return _redirect_to("/templates", str(exc))
     session.commit()
     return _redirect_to("/templates", f"DOCX template imported as a new immutable version. Subject: {subject}")
 
@@ -1706,15 +2027,13 @@ def update_sender_window(
         return _redirect_to("/settings", "Sender account not found.")
     try:
         parsed_window_start, parsed_window_end = _parse_sender_window(window_start, window_end)
+        parsed_windows = parse_sender_windows_text(
+            f"{parsed_window_start.strftime('%H:%M')}-{parsed_window_end.strftime('%H:%M')}")
     except ValueError as exc:
         return _redirect_to("/settings", str(exc))
     sender.window_start = parsed_window_start
     sender.window_end = parsed_window_end
-    sender.send_windows_json = parse_sender_windows_text(
-        f"{parsed_window_start.strftime('%H:%M')}-{parsed_window_end.strftime('%H:%M')}",
-        fallback_start=parsed_window_start,
-        fallback_end=parsed_window_end,
-    )
+    sender.send_windows_json = parsed_windows
     sender.updated_at = utc_now()
     session.add(sender)
     session.flush()
@@ -1742,8 +2061,8 @@ def update_sender_settings(
     daily_limit: int = Form(30),
     window_start: str = Form("09:30"),
     window_end: str = Form("17:30"),
-    send_timezone: str = Form("Europe/London"),
-    send_windows: str = Form(""),
+    send_timezone: str | None = Form(None),
+    send_windows: str | None = Form(None),
     interval_mode: str = Form("random"),
     random_delay_min_seconds: str = Form("180"),
     random_delay_max_seconds: str = Form("600"),
@@ -1759,9 +2078,9 @@ def update_sender_settings(
         return _redirect_to("/settings", "Daily max must be at least 1.")
     try:
         parsed_window_start, parsed_window_end = _parse_sender_window(window_start, window_end)
-        parsed_send_timezone = validate_sender_timezone(send_timezone)
+        parsed_send_timezone = validate_sender_timezone(send_timezone if isinstance(send_timezone, str) else sender.send_timezone or get_settings().app_timezone)
         parsed_send_windows = parse_sender_windows_text(
-            send_windows,
+            send_windows if isinstance(send_windows, str) else format_sender_windows(sender),
             fallback_start=parsed_window_start,
             fallback_end=parsed_window_end,
         )
@@ -1890,7 +2209,7 @@ def bulk_delete_drafts(draft_ids: list[int] = Form(default=[]), session: Session
     deleted = 0
     for draft_id in draft_ids:
         draft = session.get(EmailDraft, draft_id)
-        if draft is None or draft.status in {"queued", "sent"}:
+        if draft is None or draft.status in {"queued", "sent", "sending", "send_unknown"}:
             continue
         session.delete(draft)
         deleted += 1
@@ -1905,7 +2224,7 @@ def update_draft_attachments(
     session: Session = Depends(get_session),
 ):
     draft = session.get(EmailDraft, draft_id)
-    if draft is None or draft.status in {"sent", "simulated"}:
+    if draft is None or draft.status in {"sent", "simulated", "sending", "send_unknown"}:
         return _redirect("Draft not found or already sent.")
     draft.attachment_paths = serialize_attachment_paths(attachment_paths)
     issues = audit_draft(session, draft)
@@ -1955,6 +2274,9 @@ def start_send_batch(
     force_recent_send: bool = Form(False),
     session: Session = Depends(get_session),
 ):
+    # Direct Python callers see FastAPI's Form default object; HTTP callers
+    # receive a real bool. Only an explicit True is an override.
+    force_recent_send = force_recent_send is True
     if not draft_ids:
         return _redirect("Please select at least one approved draft before starting.")
     selected_sender_ids = sender_ids or ([sender_id] if sender_id is not None else [])
@@ -1976,7 +2298,8 @@ def start_send_batch(
     missing_draft_ids = [draft_id for draft_id, draft in zip(draft_ids, selected_drafts) if draft is None]
     if missing_draft_ids:
         local_exclusions.extend(f"Draft #{draft_id}: missing before handoff" for draft_id in missing_draft_ids)
-    selected_drafts = [draft for draft in selected_drafts if draft is not None]
+    local_exclusions.extend(f"Draft #{draft.id}: not approved" for draft in selected_drafts if draft is not None and draft.status != "approved")
+    selected_drafts = [draft for draft in selected_drafts if draft is not None and draft.status == "approved"]
     selected_drafts, duplicate_exclusions = _dedupe_batch_drafts(session, selected_drafts)
     local_exclusions.extend(duplicate_exclusions)
     if not selected_drafts:
@@ -1988,86 +2311,23 @@ def start_send_batch(
             return _redirect("Selected send template not found.")
         if is_signature_template(send_template):
             return _redirect("Signature templates cannot be used as send templates.")
-        refresh_errors: list[str] = []
-        refresh_error_ids: set[int] = set()
-        for draft in selected_drafts:
-            try:
-                refresh_draft_from_template(session, draft, send_template)
-                issues = audit_draft(session, draft)
-            except Exception as exc:
-                issues = [f"Template render error: {exc}"]
-            if issues:
-                draft.status = "pending_review"
-                draft.sender_account_id = None
-                draft.scheduled_at = None
-                draft.approved_at = None
-                draft.error_message = "; ".join(issues)
-                refresh_errors.append(f"Draft #{draft.id}: {draft.error_message}")
-                refresh_error_ids.add(draft.id)
-            elif draft.status in {"pending_review", "approved"}:
-                draft.status = "approved"
-                draft.approved_at = utc_now()
-                draft.error_message = None
-            draft.updated_at = utc_now()
-            session.add(draft)
-        session.commit()
-        if refresh_errors:
-            selected_drafts = [draft for draft in selected_drafts if draft.id not in refresh_error_ids]
-            if not selected_drafts:
-                return _redirect(f"Template refresh blocked all selected drafts. First issue: {refresh_errors[0]}")
-    recent_records = recent_company_send_records(session, {draft.company_id for draft in selected_drafts}, hours=8)
-    local_exclusions.extend(refresh_errors)
-    if recent_records and not force_recent_send:
-        recent_company_ids = {record.company_id for record in recent_records}
-        recent_drafts = [draft for draft in selected_drafts if draft.company_id in recent_company_ids]
-        for draft in recent_drafts:
-            company = session.get(Company, draft.company_id)
-            name = company.name if company else f"Company #{draft.company_id}"
-            draft.status = "pending_review"
-            draft.sender_account_id = None
-            draft.scheduled_at = None
-            draft.approved_at = None
-            draft.error_message = "Company has a successful send within the last 8 hours."
-            draft.updated_at = utc_now()
-            session.add(draft)
-            local_exclusions.append(f"Draft #{draft.id}: recent send guard for {name}")
-        session.commit()
-        selected_drafts = [draft for draft in selected_drafts if draft.company_id not in recent_company_ids]
-        if not selected_drafts:
-            return _redirect(
-                "Blocked: all selected drafts are inside the 8-hour recent-send guard. "
-                f"First issue: {local_exclusions[0]}"
-            )
-    draft_ids = [draft.id for draft in selected_drafts]
-    set_app_setting(session, "queue_paused", "false")
-    queued = 0
-    skipped = 0
-    errors: list[str] = list(local_exclusions)
-    queued_draft_ids: list[int] = []
-    for index, draft_id in enumerate(draft_ids):
-        sender = senders[index % len(senders)]
-        try:
-            queue_draft(session, draft_id, sender.id, commit=False)
-            queued += 1
-            queued_draft_ids.append(draft_id)
-            if recent_records and force_recent_send:
-                session.add(EmailEvent(draft_id=draft_id, event_type="recent_send_override"))
-        except ValueError as exc:
-            skipped += 1
-            errors.append(str(exc))
-    session.commit()
-    processed_now = {"sent": 0, "failed": 0, "skipped": 0}
-    if queued_draft_ids:
-        processed_now = process_due_queue(session, limit=1, draft_ids=queued_draft_ids)
-    queue_state = reconcile_queue_state(session)
-    sync_power_awake(session)
-    if errors:
-        return _redirect(
-            f"Started sending with local exclusions: queued={queued}, excluded={len(errors)}, "
-            f"first exclusion={errors[0]}. Current queue={queue_state['queued_count']}."
+    try:
+        handoff = create_queue_handoff(
+            session,
+            [draft.id for draft in selected_drafts],
+            [sender.id for sender in senders],
+            selected_template_id,
+            send_mode,
+            allow_recent_duplicate=force_recent_send,
         )
+    except ValueError as exc:
+        return _redirect(str(exc))
+    sync_power_awake(session)
+    exclusion_note = f" Local roster exclusions: {len(local_exclusions)}." if local_exclusions else ""
     return _redirect(
-        f"Started sending: mode={send_mode}, sender_count={len(senders)}, queued {queued} draft(s). Current queue={queue_state['queued_count']}. Immediate processing: sent={processed_now['sent']}, failed={processed_now['failed']}, skipped={processed_now['skipped']}. Minimum interval is strictly 30 seconds."
+        f"Started sending: {handoff.total_count} draft(s) accepted as one queue intake. "
+        f"It will import continuously in batches of {handoff.batch_size} with no further confirmation." 
+        f"{exclusion_note}"
     )
 
 
@@ -2088,20 +2348,24 @@ def cancel_queue_items(draft_ids: list[int] = Form(default=[]), session: Session
         except ValueError:
             skipped += 1
     session.commit()
-    reconcile_queue_state(session)
     sync_power_awake(session)
     return _redirect(f"Cancelled queued draft(s): {cancelled}. Skipped: {skipped}.")
 
 
 @app.post("/queue/cancel-all")
 def cancel_all_queue(session: Session = Depends(get_session)):
-    drafts = session.exec(select(EmailDraft).where(EmailDraft.status == "queued")).all()
-    for draft in drafts:
-        cancel_queued_draft(session, draft)
-    session.commit()
-    reconcile_queue_state(session)
+    with QUEUE_PROCESSING_LOCK:
+        drafts = session.exec(select(EmailDraft).where(EmailDraft.status == "queued")).all()
+        for draft in drafts:
+            cancel_queued_draft(session, draft)
+        handoffs = session.exec(select(QueueHandoffRun).where(QueueHandoffRun.status.in_(("pending", "running")))).all()
+        for handoff in handoffs:
+            handoff.status = "cancelled"
+            handoff.updated_at = utc_now()
+            session.add(handoff)
+        session.commit()
     sync_power_awake(session)
-    return _redirect(f"Cancelled all queued drafts: {len(drafts)}.")
+    return _redirect(f"Cancelled all queued drafts: {len(drafts)}. Cancelled pending batches: {len(handoffs)}.")
 
 
 @app.post("/queue/pause")
@@ -2109,8 +2373,8 @@ def pause_queue(session: Session = Depends(get_session)):
     queue_state = reconcile_queue_state(session)
     if not queue_state["has_queue"]:
         return _redirect("当前没有待发送队列。")
-    set_app_setting(session, "queue_paused", "true")
-    queue_state = reconcile_queue_state(session)
+    with QUEUE_PROCESSING_LOCK:
+        set_app_setting(session, "queue_paused", "true")
     sync_power_awake(session)
     return _redirect("发送队列已暂停。")
 
@@ -2122,7 +2386,6 @@ def resume_queue(session: Session = Depends(get_session)):
         return _redirect("当前没有待发送队列，已回到开始发送。")
     set_app_setting(session, "queue_paused", "false")
     result = process_due_queue(session, limit=1)
-    reconcile_queue_state(session)
     sync_power_awake(session)
     return _redirect(
         f"发送队列已继续。立即处理：sent={result['sent']}, failed={result['failed']}, skipped={result['skipped']}。"
@@ -2151,15 +2414,57 @@ def process_queue_now(session: Session = Depends(get_session)):
     if result.get("paused"):
         sync_power_awake(session)
         return _redirect("发送队列已暂停，点击继续发送后再处理。")
-    reconcile_queue_state(session)
     sync_power_awake(session)
     return _redirect(f"Queue processed: sent={result['sent']}, failed={result['failed']}, skipped={result['skipped']}.")
+
+
+@app.get("/queue/handoff/status")
+def queue_handoff_status(session: Session = Depends(get_session)):
+    """Read-only progress for the current or most recent one-click intake."""
+    handoff = session.exec(
+        select(QueueHandoffRun).order_by(QueueHandoffRun.created_at.desc(), QueueHandoffRun.id.desc())
+    ).first()
+    if handoff is None:
+        return {"status": "idle", "total": 0, "cursor": 0, "queued": 0, "excluded": 0, "last_error": None}
+    return {
+        "id": handoff.id,
+        "status": handoff.status,
+        "total": handoff.total_count,
+        "cursor": handoff.cursor,
+        "queued": handoff.queued_count,
+        "excluded": handoff.excluded_count,
+        "batch_size": handoff.batch_size,
+        "last_error": handoff.last_error,
+        "updated_at": handoff.updated_at,
+    }
 
 
 @app.post("/followups/scan")
 def scan_followups_now(session: Session = Depends(get_session)):
     result = scan_followups(session)
     return _redirect(f"Follow-up scan created {result['followup_drafts']} pending-review draft(s).")
+
+
+@app.post("/followups/generate-batch")
+def generate_followup_batch(
+    template_id: int = Form(...),
+    limit: int = Form(250),
+    priorities: str = Form("A,B,C"),
+    session: Session = Depends(get_session),
+):
+    try:
+        result = generate_dual_counter_followups(
+            session,
+            template_id=template_id,
+            priorities=priorities,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return _redirect_to("/rules", str(exc))
+    return _redirect_to(
+        "/rules",
+        f"双计数器手动批次已生成 {result['followup_drafts']} / {limit} 封待审核草稿；未启用自动跟进，未发送邮件。",
+    )
 
 
 @app.post("/followup-rules")
@@ -2170,22 +2475,43 @@ def create_followup_rule(
     priorities: str = Form("A,B,C"),
     session: Session = Depends(get_session),
 ):
-    template = session.get(EmailTemplate, template_id)
-    if template is None:
-        return _redirect("Follow-up template not found.")
-    if is_signature_template(template):
-        return _redirect("Signature templates cannot be used for follow-up rules.")
-    session.add(FollowUpRule(name=name, delay_days=delay_days, template_id=template_id, priorities=priorities))
-    session.commit()
-    return _redirect("Follow-up rule saved.")
+    return _redirect_to("/rules", "旧版固定延迟规则已停用；请使用双计数器跟进规则。")
+
+
+@app.post("/followup-cadence")
+def update_followup_cadence(
+    enabled: bool = Form(False),
+    template_id: int | None = Form(None),
+    priorities: str = Form("A,B,C"),
+    session: Session = Depends(get_session),
+):
+    try:
+        cadence = save_followup_cadence(
+            session,
+            enabled=enabled,
+            template_id=template_id,
+            priorities=priorities,
+        )
+    except ValueError as exc:
+        return _redirect_to("/rules", str(exc))
+    state = "已启用" if cadence.enabled else "已保存为停用"
+    return _redirect_to(
+        "/rules",
+        f"双计数器跟进规则{state}：同一联系人每次成功发送后增加 {cadence.contact_step_hours}h；"
+        f"更换联系人时，公司级最短间隔 {cadence.company_switch_min_hours}h。",
+    )
 
 
 @app.post("/suppressions")
 def add_suppression(email: str = Form(...), reason: str = Form("blacklist"), session: Session = Depends(get_session)):
     normalized = email.strip().lower()
-    if not session.exec(select(Suppression).where(Suppression.email == normalized)).first():
-        session.add(Suppression(email=normalized, reason=reason))
-        session.commit()
+    rule = session.exec(select(Suppression).where(func.lower(Suppression.email) == normalized)).first()
+    if rule is None:
+        rule = Suppression(email=normalized, reason=reason)
+    rule.reason = reason
+    rule.expires_at = None
+    session.add(rule)
+    session.commit()
     return _redirect("Suppression saved.")
 
 
@@ -2222,3 +2548,4 @@ def bd_database_sync_status(session: Session = Depends(get_session)):
     status = get_bd_master_sync_status(session, get_settings().bd_database_path)
     status["scheduler_running"] = scheduler.running
     return status
+

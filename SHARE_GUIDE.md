@@ -1,46 +1,95 @@
-# 海外营销 Workbench 分享与安装说明
+# BD Email Workbench 分享说明
 
-公开版本通过 GitHub Release 提供。下载版本号对应的 ZIP，解压到普通 Windows 文件夹，例如：
+Use this workflow when sharing BD Email Workbench with another person.
 
-```text
-C:\Overseas_Marketing_Workbench
+## Create The Package
+
+Run from the project root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\create_shareable_package.ps1
 ```
 
-## 首次启动
+The zip is created under:
 
-1. 安装 Python 3，并确保 Windows 可以使用 `py -3`、`python` 或 `python3` 命令。
-2. 双击 `install_skills.cmd` 安装随包 Codex Skills。
-3. 重启 Codex，发送：`请使用 $workbench-first-run-check 检查并完成海外营销 Workbench 首次配置。`
-4. 未发现旧版本时双击 `start.cmd`；如果发现旧版本，优先按检查结果原地升级，避免同时运行两套软件。
-5. 浏览器未自动打开时访问 `http://127.0.0.1:8001`。
+```text
+releases/
+```
 
-首次启动会在本机创建 `.env`、`.venv` 和新的 SQLite 数据库。公开包不包含真实邮箱密码、客户数据、发送记录、日志、备份或真实签名。
+## What The Clean Package Excludes
 
-## 最小配置
+The package must not include:
 
-开始实际发送前，只需先完成四项：
+- `.env`
+- `.venv/`
+- `data/`
+- `reports/`
+- `backups/`
+- `code_backups/`
+- `releases/`
+- internal maintenance docs
+- `*.db`, `*.sqlite`, `*.log`, `*.pyc`
+- `data/.secret_key`
 
-- 至少一个可正常连接的 SMTP 发件邮箱。
-- 已替换为本人信息并预览过的签名。
-- Workbench 能正常启动，`/health` 检查通过。
-- 7 个随包 Skills 已安装，Codex 重启后可以识别。
+This keeps customer data, sender passwords, send history, local backups, and machine-specific runtime files out of the shared copy.
 
-邮箱密码应只保存在使用者自己的电脑上，不要提交到 GitHub，也不要发到聊天中。
+## Recipient Startup
 
-## 安全默认值
+The recipient should:
+
+1. Install Python 3.12. Python 3.11 and 3.13 are also supported; avoid Python 3.14 for this release.
+2. Unzip the package into a normal Windows folder, for example:
+
+   ```text
+   C:\BD_Email_Workbench_Lite
+   ```
+
+3. Double-click:
+
+   ```text
+   start.cmd
+   ```
+
+4. Open this URL if the browser does not open automatically:
+
+   ```text
+   http://127.0.0.1:8001
+   ```
+
+On first launch, `start.cmd` creates `.env`, creates `.venv`, installs dependencies, creates a fresh SQLite database, and starts the local app.
+
+## Safe Defaults
+
+The clean package starts with:
 
 ```text
 DRY_RUN_EMAIL=true
 ENABLE_OPEN_TRACKING=false
 ```
 
-先在 dry-run 模式检查发件人、收件人、模板、签名、NO-GO、抑制状态和队列。准备实际发送时，再由使用者明确切换发送设置；SMTP 接受不代表最终投递成功。
+No real email is sent until the recipient configures sender settings and switches out of dry-run mode.
 
-## 签名与区域规则
+## Sender Setup
 
-在 `Settings` 的签名模块中配置姓名、职位、公司、地址、展示邮箱、电话、国家规则和发件邮箱规则。也可以导入 `.docx` 签名块保留图片和富文本格式。
+Before real SMTP sending, the recipient should:
 
-国家规则示例：
+1. Open the sender settings page.
+2. Add their own sender mailbox.
+3. Save their SMTP app password in the page, or configure the password variable in `.env`.
+4. Test with `DRY_RUN_EMAIL=true`.
+5. Only switch to real sending after checking sender, template, recipient list, and queue status.
+
+## Signature Setup
+
+The clean package includes the signature module, but the recipient should replace the default identity before sending:
+
+1. Open `Settings`.
+2. Find `Signature module`.
+3. Edit sender name, title prefix, company name, address, default display email, phone numbers, country rules, and sender-mailbox rules.
+4. Optionally import a `.docx` signature block for fixed images or visual formatting.
+5. Return to `Workbench` and use `Signature confirmation` in the draft-generation step to preview the final signature by recipient country and sender mailbox.
+
+Country rules use this format:
 
 ```text
 United Kingdom, UK, Ireland|UK & IE|+1 555 0100
@@ -48,30 +97,19 @@ France|FR|+1 555 0100
 Thailand, Vietnam, Malaysia, Singapore, Indonesia, Philippines|Southeast Asia|+1 555 0101
 ```
 
-发件邮箱规则示例：
+Sender-mailbox rules use this format:
 
 ```text
 sender@example.com|display@example.com|+1 555 0100|UK & IE|Sender Name
 ```
 
-以上信息均为虚构占位示例，使用前必须替换。
+## Verify A Package
 
-## 已有版本升级
-
-先用 `$workbench-first-run-check` 找到唯一主版本，再预览更新：
+Run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\update_existing_workbench.ps1 -TargetRoot "<existing-workbench-root>"
+powershell -ExecutionPolicy Bypass -File .\scripts\verify_shareable_package.ps1 -Path .\releases\<package>.zip
 ```
 
-确认目标后增加 `-Apply`。更新脚本会保留本机 `.env`、`.venv`、`data/`、邮箱凭据、签名、发送记录、报告和备份。
+If verification fails, do not share the package.
 
-## 包校验
-
-维护者可以运行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\verify_shareable_package.ps1 -Path "<release-zip>"
-```
-
-校验失败时不要分享或安装该 ZIP。

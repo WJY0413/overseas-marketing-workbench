@@ -1,4 +1,5 @@
 import imaplib
+import ssl
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ from app.models import (
 )
 from app.services.mailer import _read_env_value
 from app.services.secrets import decrypt_secret
+from app.services.suppression import is_active_suppression
 from app.time_utils import utc_now
 
 REMOVED_EMAIL_DOMAIN = "invalid.invalid"
@@ -88,6 +90,11 @@ def _message_text(message: Message) -> str:
             content_type = part.get_content_type()
             if content_type not in {"text/plain", "message/delivery-status"}:
                 continue
+            if content_type == "message/delivery-status":
+                blocks = part.get_payload()
+                if isinstance(blocks, list):
+                    parts.extend(block.as_string() for block in blocks)
+                continue
             payload = part.get_payload(decode=True)
             if payload is None:
                 continue
@@ -108,9 +115,30 @@ def _is_bounce(message_from: str, subject: str, body: str) -> bool:
 
 def _extract_failed_recipients(body: str) -> set[str]:
     recipients = {match.group(1).strip(" <>.,;:").lower() for match in FINAL_RECIPIENT_RE.finditer(body)}
-    if recipients:
-        return recipients
-    return {email.strip(" <>.,;:").lower() for email in EMAIL_RE.findall(body)}
+    # Unlabelled addresses in signatures/quoted messages are not failure evidence.
+    return recipients
+
+
+def _failed_recipient_reports(message: Message, body: str) -> list[tuple[str, str]]:
+    reports: list[tuple[str, str]] = []
+    has_dsn = False
+    for part in message.walk():
+        if part.get_content_type() != "message/delivery-status":
+            continue
+        has_dsn = True
+        blocks = part.get_payload()
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            action = (block.get("Action") or "").strip().casefold()
+            status = (block.get("Status") or "").strip()
+            if action not in {"failed", "delayed"} or not status.startswith(("4.", "5.")):
+                continue
+            section = block.as_string()
+            reports.extend((recipient, section) for recipient in sorted(_extract_failed_recipients(section)))
+    if has_dsn:
+        return reports
+    return [(recipient, body) for recipient in sorted(_extract_failed_recipients(body))]
 
 
 def _extract_reason(body: str) -> str:
@@ -208,13 +236,19 @@ def _removed_email_for_contact(contact_id: int) -> str:
 
 def _remove_bounced_contact_info(session: Session, contact: Contact, bounced_email: str) -> dict[str, int]:
     stats = {"contacts_preserved": 0, "emails_removed": 0, "drafts_deleted": 0, "send_records_deleted": 0, "routes_deleted": 0}
-    drafts = session.exec(select(EmailDraft).where(EmailDraft.contact_id == contact.id)).all()
-    draft_ids = [draft.id for draft in drafts if draft.id is not None]
-    if draft_ids:
-        session.exec(delete(EmailEvent).where(EmailEvent.draft_id.in_(draft_ids)))
-        session.exec(delete(EmailDraft).where(EmailDraft.id.in_(draft_ids)))
-        stats["drafts_deleted"] += len(draft_ids)
-    stats["send_records_deleted"] += session.exec(delete(SendRecord).where(SendRecord.contact_id == contact.id)).rowcount or 0
+    # Keep all historic bodies, send records and bounce associations auditable.
+    # Only unsent work using this currently failed route loses approval.
+    drafts = session.exec(select(EmailDraft).where(
+        EmailDraft.contact_id == contact.id,
+        EmailDraft.status.in_(("pending_review", "approved", "queued")),
+    )).all()
+    for draft in drafts:
+        draft.status = "pending_review"
+        draft.sender_account_id = None
+        draft.scheduled_at = None
+        draft.approved_at = None
+        draft.error_message = f"Recipient route suppressed after bounce: {bounced_email}"
+        session.add(draft)
     stats["routes_deleted"] += session.exec(
         delete(ContactRoute).where(
             ContactRoute.contact_id == contact.id,
@@ -252,7 +286,7 @@ def cleanup_bounced_contacts(session: Session) -> dict[str, int]:
         suppression = session.exec(
             select(Suppression).where(func.lower(Suppression.email) == normalized)
         ).first()
-        if suppression is None:
+        if suppression is None or not is_active_suppression(suppression):
             # First non-hard bounce remains retry-eligible. BounceRecord is audit
             # evidence only until a hard bounce or consecutive second bounce.
             continue
@@ -262,11 +296,6 @@ def cleanup_bounced_contacts(session: Session) -> dict[str, int]:
         stats["emails_processed"] += 1
 
         company = session.get(Company, contact.company_id)
-        for record in session.exec(select(BounceRecord).where(func.lower(BounceRecord.recipient_email) == normalized)).all():
-            record.send_record_id = None
-            record.contact_id = None
-            session.add(record)
-
         delete_stats = _remove_bounced_contact_info(session, contact, normalized)
         if company is not None and company.status == "bounced":
             company.status = "new"
@@ -357,6 +386,11 @@ def _record_bounce(
         if existing_suppression is None:
             prefix = "hard bounce" if hard_bounce else "consecutive second bounce"
             session.add(Suppression(email=recipient, reason=f"{prefix}: {reason[:160]}"))
+        elif not is_active_suppression(existing_suppression):
+            prefix = "hard bounce" if hard_bounce else "consecutive second bounce"
+            existing_suppression.reason = f"{prefix}: {reason[:160]}"
+            existing_suppression.expires_at = None
+            session.add(existing_suppression)
 
     if send_record.draft_id:
         session.add(
@@ -391,7 +425,7 @@ def scan_sender_bounces(session: Session, sender: SenderAccount, lookback_days: 
     host, port = _imap_host_for_sender(sender)
     lookback = lookback_days if lookback_days is not None else get_settings().bounce_scan_lookback_days
     try:
-        with imaplib.IMAP4_SSL(host, port, timeout=30) as mailbox:
+        with imaplib.IMAP4_SSL(host, port, timeout=30, ssl_context=ssl.create_default_context()) as mailbox:
             mailbox.login(sender.smtp_username or sender.email, password)
             mailbox.select("INBOX", readonly=True)
             status, search_data = mailbox.uid("SEARCH", None, "ALL")
@@ -417,12 +451,15 @@ def scan_sender_bounces(session: Session, sender: SenderAccount, lookback_days: 
                 if not _is_bounce(message_from, subject, body):
                     continue
                 result.detected_bounces += 1
-                recipients = _extract_failed_recipients(body)
-                for recipient in sorted(recipients):
+                reports = _failed_recipient_reports(message, body)
+                if not reports:
+                    result.errors += 1
+                    logger.warning("bounce needs review sender=%s uid=%s: no explicit failed-recipient evidence", sender.email, uid)
+                for recipient, recipient_body in reports:
                     send_record = _latest_send_for_recipient(session, recipient, sender)
                     if send_record is None:
                         continue
-                    decision = _record_bounce(session, sender, uid, message, recipient, send_record, body)
+                    decision = _record_bounce(session, sender, uid, message, recipient, send_record, recipient_body)
                     if decision:
                         if decision == "soft_retry":
                             result.retry_eligible_bounces += 1
@@ -435,7 +472,7 @@ def scan_sender_bounces(session: Session, sender: SenderAccount, lookback_days: 
                             recipient,
                             send_record.id,
                             uid,
-                            _extract_reason(body),
+                            _extract_reason(recipient_body),
                         )
             session.commit()
     except Exception as exc:

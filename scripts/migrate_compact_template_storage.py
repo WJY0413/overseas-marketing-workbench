@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-ACTIVE_DRAFT_STATUSES = ("pending_review", "approved", "queued")
+ACTIVE_DRAFT_STATUSES = ("pending_review", "approved", "queued", "sending", "send_unknown")
 COMPACT_STORAGE_VERSION_KEY = "compact_template_storage_version"
 COMPACT_STORAGE_VERSION = "2"
 
@@ -16,13 +16,13 @@ def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
 def _payload_chars(connection: sqlite3.Connection) -> dict[str, int]:
     return {
         "emaildraft_body_html": connection.execute(
-            "SELECT COALESCE(SUM(LENGTH(COALESCE(body_html, ''))), 0) FROM emaildraft"
+            "SELECT COALESCE(SUM(LENGTH(COALESCE(body_html, ''))), 0) FROM email_drafts"
         ).fetchone()[0],
         "emaildraft_template_snapshot": connection.execute(
-            "SELECT COALESCE(SUM(LENGTH(COALESCE(template_snapshot, ''))), 0) FROM emaildraft"
+            "SELECT COALESCE(SUM(LENGTH(COALESCE(template_snapshot, ''))), 0) FROM email_drafts"
         ).fetchone()[0],
         "sendrecord_body_html": connection.execute(
-            "SELECT COALESCE(SUM(LENGTH(COALESCE(body_html, ''))), 0) FROM sendrecord"
+            "SELECT COALESCE(SUM(LENGTH(COALESCE(body_html, ''))), 0) FROM activity_records"
         ).fetchone()[0],
     }
 
@@ -36,49 +36,49 @@ def compact_database(database_path: Path, *, vacuum: bool) -> dict:
 
     before_bytes = database_path.stat().st_size
     before_payload = _payload_chars(connection)
-    sendrecord_columns = _column_names(connection, "sendrecord")
-    emaildraft_columns = _column_names(connection, "emaildraft")
+    sendrecord_columns = _column_names(connection, "activity_records")
+    emaildraft_columns = _column_names(connection, "email_drafts")
 
     connection.execute("BEGIN IMMEDIATE")
     try:
         if "template_id" not in sendrecord_columns:
             connection.execute(
-                "ALTER TABLE sendrecord ADD COLUMN template_id INTEGER REFERENCES emailtemplate(id)"
+                "ALTER TABLE activity_records ADD COLUMN template_id INTEGER REFERENCES email_templates(template_id)"
             )
         if "signature_template_id" not in sendrecord_columns:
             connection.execute(
-                "ALTER TABLE sendrecord ADD COLUMN signature_template_id INTEGER REFERENCES emailtemplate(id)"
+                "ALTER TABLE activity_records ADD COLUMN signature_template_id INTEGER REFERENCES email_templates(template_id)"
             )
         if "signature_template_id" not in emaildraft_columns:
             connection.execute(
-                "ALTER TABLE emaildraft ADD COLUMN signature_template_id INTEGER REFERENCES emailtemplate(id)"
+                "ALTER TABLE email_drafts ADD COLUMN signature_template_id INTEGER REFERENCES email_templates(template_id)"
             )
 
         connection.execute(
             """
-            UPDATE sendrecord
+            UPDATE activity_records
             SET template_id = (
-                SELECT emaildraft.template_id
-                FROM emaildraft
-                WHERE emaildraft.id = sendrecord.draft_id
+                SELECT email_drafts.template_id
+                FROM email_drafts
+                WHERE email_drafts.draft_id = activity_records.draft_id
             )
             WHERE template_id IS NULL
             """
         )
         connection.execute(
             """
-            UPDATE sendrecord
+            UPDATE activity_records
             SET signature_template_id = (
-                SELECT emaildraft.signature_template_id
-                FROM emaildraft
-                WHERE emaildraft.id = sendrecord.draft_id
+                SELECT email_drafts.signature_template_id
+                FROM email_drafts
+                WHERE email_drafts.draft_id = activity_records.draft_id
             )
             WHERE signature_template_id IS NULL
             """
         )
         sendrecord_rows_cleared = connection.execute(
             """
-            UPDATE sendrecord
+            UPDATE activity_records
             SET body_html = '', body_text = NULL
             WHERE LENGTH(COALESCE(body_html, '')) > 0
                OR LENGTH(COALESCE(body_text, '')) > 0
@@ -87,7 +87,7 @@ def compact_database(database_path: Path, *, vacuum: bool) -> dict:
         placeholders = ",".join("?" for _ in ACTIVE_DRAFT_STATUSES)
         draft_rows_cleared = connection.execute(
             f"""
-            UPDATE emaildraft
+            UPDATE email_drafts
             SET body_html = '', body_text = NULL, template_snapshot = NULL
             WHERE status NOT IN ({placeholders})
               AND (
@@ -98,23 +98,15 @@ def compact_database(database_path: Path, *, vacuum: bool) -> dict:
             """,
             ACTIVE_DRAFT_STATUSES,
         ).rowcount
-        active_snapshots_cleared = connection.execute(
-            f"""
-            UPDATE emaildraft
-            SET template_snapshot = NULL
-            WHERE status IN ({placeholders})
-              AND LENGTH(COALESCE(template_snapshot, '')) > 0
-            """,
-            ACTIVE_DRAFT_STATUSES,
-        ).rowcount
+        active_snapshots_cleared = 0  # Active execution metadata must survive compaction.
         connection.execute(
-            "CREATE INDEX IF NOT EXISTS ix_sendrecord_template_id ON sendrecord (template_id)"
+            "CREATE INDEX IF NOT EXISTS ix_sendrecord_template_id ON activity_records (template_id)"
         )
         connection.execute(
-            "CREATE INDEX IF NOT EXISTS ix_sendrecord_signature_template_id ON sendrecord (signature_template_id)"
+            "CREATE INDEX IF NOT EXISTS ix_sendrecord_signature_template_id ON activity_records (signature_template_id)"
         )
         connection.execute(
-            "CREATE INDEX IF NOT EXISTS ix_emaildraft_signature_template_id ON emaildraft (signature_template_id)"
+            "CREATE INDEX IF NOT EXISTS ix_emaildraft_signature_template_id ON email_drafts (signature_template_id)"
         )
         connection.commit()
     except Exception:
@@ -133,12 +125,12 @@ def compact_database(database_path: Path, *, vacuum: bool) -> dict:
         SELECT
             COUNT(*),
             SUM(CASE WHEN template_id IS NOT NULL THEN 1 ELSE 0 END)
-        FROM sendrecord
+        FROM activity_records
         """
     ).fetchone()
     connection.execute(
         """
-        INSERT INTO appsetting ("key", "value", updated_at)
+        INSERT INTO app_settings ("key", "value", updated_at)
         VALUES (?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT("key") DO UPDATE
         SET "value" = excluded."value", updated_at = CURRENT_TIMESTAMP

@@ -44,6 +44,7 @@ def main():
     from app.db import engine
     from app.models import AppSetting, EmailDraft, SenderAccount
     from app.time_utils import utc_now
+    from app.services.queue import format_sender_windows, parse_sender_windows_text, sender_windows
 
     def parse_time(value: str | None):
         if not value:
@@ -61,7 +62,7 @@ def main():
         for sender in senders:
             print(
                 f"  id={sender.id} email={sender.email} active={int(sender.is_active)} "
-                f"limit={sender.daily_limit} window={sender.window_start}-{sender.window_end} "
+                f"limit={sender.daily_limit} timezone={sender.send_timezone} windows={format_sender_windows(sender)} "
                 f"delay={sender.random_delay_min_seconds}-{sender.random_delay_max_seconds} "
                 f"open_tracking={int(sender.enable_open_tracking)}"
             )
@@ -79,16 +80,17 @@ def main():
                 changes.append(("sender.daily_limit", sender.daily_limit, args.daily_limit))
                 if args.apply:
                     sender.daily_limit = args.daily_limit
-            if args.window_start:
-                new_value = parse_time(args.window_start)
-                changes.append(("sender.window_start", sender.window_start, new_value))
+            if args.window_start or args.window_end:
+                current = sender_windows(sender)
+                if len(current) != 1 and not (args.window_start and args.window_end):
+                    raise SystemExit("blocked: multiple windows require both --window-start and --window-end to replace the window set")
+                start = parse_time(args.window_start) or current[0][0]
+                end = parse_time(args.window_end) or current[0][1]
+                windows = parse_sender_windows_text("", fallback_start=start, fallback_end=end)
+                changes.append(("sender.send_windows", format_sender_windows(sender), f"{start}-{end}"))
                 if args.apply:
-                    sender.window_start = new_value
-            if args.window_end:
-                new_value = parse_time(args.window_end)
-                changes.append(("sender.window_end", sender.window_end, new_value))
-                if args.apply:
-                    sender.window_end = new_value
+                    sender.window_start, sender.window_end = start, end
+                    sender.send_windows_json = windows
             if args.delay_min is not None:
                 changes.append(("sender.random_delay_min_seconds", sender.random_delay_min_seconds, args.delay_min))
                 if args.apply:

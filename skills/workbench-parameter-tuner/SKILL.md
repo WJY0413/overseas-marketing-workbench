@@ -1,6 +1,6 @@
 ---
 name: workbench-parameter-tuner
-description: Inspect or modify common Overseas Marketing Workbench operational parameters such as sender daily_limit, send windows, random delay range, open tracking flag, active flag, and queue_paused. Use when the operator asks to change daily send limits, sender windows, queue pause/resume state, send interval parameters, sender activation, or other routine Workbench settings. This skill is not for sending email, inbox checks, queue construction, version updates, or data migrations.
+description: Inspect or modify common BD Email Workbench operational parameters such as sender daily_limit, send windows, random delay range, open tracking flag, active flag, and queue_paused. Use when the operator asks to change daily send limits, sender windows, queue pause/resume state, send interval parameters, sender activation, or other routine Workbench settings. This skill is not for sending email, inbox checks, queue construction, version updates, or data migrations.
 ---
 
 # Workbench Parameter Tuner

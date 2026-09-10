@@ -6,7 +6,11 @@ from sqlmodel import Session
 
 from app.config import get_settings
 from app.models import Company, Contact, EmailTemplate, SenderAccount
-from app.services.render_validation import validate_rendered_message, validate_template_context
+from app.services.render_validation import (
+    contains_cjk_characters,
+    validate_rendered_message,
+    validate_template_context,
+)
 from app.services.signatures import append_signature, get_signature_config, get_signature_template, signature_context
 
 env = Environment(undefined=StrictUndefined, autoescape=True)
@@ -19,8 +23,11 @@ def context_for(
     session: Session | None = None,
 ) -> dict[str, str | None]:
     signature = signature_context(get_signature_config(session), company=company, contact=contact, sender=sender)
+    first_name = (contact.first_name or "").strip()
+    if not first_name or contains_cjk_characters(first_name):
+        first_name = "Team"
     return {
-        "first_name": contact.first_name or contact.full_name.split(" ")[0],
+        "first_name": first_name,
         "contact_name": contact.full_name,
         "position": contact.position,
         "email": contact.email,

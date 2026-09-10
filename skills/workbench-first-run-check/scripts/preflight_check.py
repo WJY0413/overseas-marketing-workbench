@@ -18,7 +18,7 @@ EXPECTED_SKILLS = (
     "workbench-email-daily-runbook",
     "workbench-send-mail",
     "workbench-inbox-check",
-    "email-bounce-suppression",
+    "email-bounce-suppressions",
     "workbench-queue-builder",
     "workbench-parameter-tuner",
 )
@@ -127,7 +127,7 @@ def default_candidates() -> list[Path]:
         Path.cwd(),
         Path(r"C:\BD_Email_Workbench\production"),
         Path(r"C:\BD_Email_Workbench_Lite"),
-        Path(r"<detected-workbench-root>"),
+        Path(r"D:\BD_Email_Workbench\production"),
         user_profile / "BD_Email_Workbench" / "production",
         user_profile / "BD_Email_Workbench_Lite",
         user_profile / "Documents" / "bd-email-workbench-lite",
@@ -227,11 +227,12 @@ def sender_status(root: Path) -> tuple[bool, int, str]:
     try:
         connection = open_read_only(database)
         connection.row_factory = sqlite3.Row
-        if not table_exists(connection, "senderaccount"):
-            return False, 0, "senderaccount table missing"
+        sender_table = "sender_accounts" if table_exists(connection, "sender_accounts") else "senderaccount"
+        if not table_exists(connection, sender_table):
+            return False, 0, "sender table missing"
         columns = {
             row[1]
-            for row in connection.execute("PRAGMA table_info(senderaccount)").fetchall()
+            for row in connection.execute(f"PRAGMA table_info({sender_table})").fetchall()
         }
         encrypted_expr = (
             "COALESCE(smtp_password_encrypted, '')" if "smtp_password_encrypted" in columns else "''"
@@ -239,7 +240,7 @@ def sender_status(root: Path) -> tuple[bool, int, str]:
         rows = connection.execute(
             "SELECT email, smtp_host, smtp_username, password_env, "
             f"{encrypted_expr} AS encrypted_password "
-            "FROM senderaccount WHERE COALESCE(is_active, 1)=1"
+            f"FROM {sender_table} WHERE COALESCE(is_active, 1)=1"
         ).fetchall()
     except sqlite3.Error as exc:
         return False, 0, f"database read failed: {exc}"
@@ -272,15 +273,17 @@ def signature_status(root: Path) -> tuple[bool, str]:
         return False, "database not initialized"
     try:
         connection = open_read_only(database)
-        if not table_exists(connection, "appsetting"):
+        settings_table = "app_settings" if table_exists(connection, "app_settings") else "appsetting"
+        if not table_exists(connection, settings_table):
             return False, "signature settings table missing"
         row = connection.execute(
-            "SELECT value FROM appsetting WHERE key='email_signature_config' LIMIT 1"
+            f"SELECT value FROM {settings_table} WHERE key='email_signature_config' LIMIT 1"
         ).fetchone()
         active_template = False
-        if table_exists(connection, "emailtemplate"):
+        template_table = "email_templates" if table_exists(connection, "email_templates") else "emailtemplate"
+        if table_exists(connection, template_table):
             active_template = connection.execute(
-                "SELECT 1 FROM emailtemplate "
+                f"SELECT 1 FROM {template_table} "
                 "WHERE template_type='signature' AND COALESCE(is_active, 1)=1 "
                 "AND LENGTH(TRIM(COALESCE(body_html, ''))) > 0 LIMIT 1"
             ).fetchone() is not None
@@ -323,14 +326,14 @@ def environment_status(root: Path, health_url: str) -> tuple[bool, str]:
                 python_version = (int(match.group(1)), int(match.group(2)))
         except (OSError, subprocess.SubprocessError):
             return False, "existing virtual-environment Python is not runnable"
-    python_ok = python_version[0] == 3
+    python_ok = (3, 11) <= python_version < (4, 0)
     files_ok = (
         (root / "requirements.txt").is_file()
         and (root / "app" / "main.py").is_file()
         and ((root / "start.cmd").is_file() or (root / "start_production.cmd").is_file())
     )
     if not python_ok:
-        return False, f"Python 3 is required; found {python_version[0]}.{python_version[1]}"
+        return False, f"unsupported Python {python_version[0]}.{python_version[1]}"
     if not files_ok:
         return False, "required launcher or application files missing"
     if health_url:
@@ -340,7 +343,7 @@ def environment_status(root: Path, health_url: str) -> tuple[bool, str]:
                     return False, f"health check returned HTTP {response.status}"
         except Exception as exc:  # noqa: BLE001 - concise readiness result is intentional.
             return False, f"health check failed: {exc}"
-    return True, "launch files and runnable Python 3 found"
+    return True, "launch files and supported Python found"
 
 
 def duplicate_skill_dirs(skills_root: Path, skill_name: str) -> list[str]:

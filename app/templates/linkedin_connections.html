@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>LinkedIn 建联</title><link rel="stylesheet" href="/static/styles.css?v={{ app_version }}" /></head>
+<body><main class="shell">{% include "_nav.html" %}<section class="content">
+  <header class="topbar"><div><h1>LinkedIn 建联</h1><p>LinkedIn 联系人主库；每批展示 {{ batch_size }} 位待建联联系人。</p></div><a class="button secondary" href="/">返回工作台</a></header>
+  {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+  <section class="metrics"><div class="metric"><span>今日已确认建联</span><strong id="dashboard-people">{{ metrics.people }} 人</strong></div></section>
+        <section class="panel">
+          <form method="get" action="/linkedin-connections" class="form-grid">
+            <label>每批数量<select name="batch_size">{% for size in [10,15,20] %}<option value="{{ size }}" {% if batch_size == size %}selected{% endif %}>{{ size }}</option>{% endfor %}</select></label>
+            <label>搜索<input id="candidate-query" name="query" value="{{ query }}" placeholder="姓名、来源或公司" /></label>
+            <button class="secondary" type="submit">刷新列表</button>
+          </form>
+          <div class="bulk-actions"><button id="confirm-batch" type="button">本批一键确认建联</button><small>当前批次已按综合排名筛选；确认仅记录你已手工完成的建联。</small></div>
+          <div id="linkedin-feedback" class="notice" hidden></div>
+          <div class="table-wrap"><table><thead><tr><th>确认</th><th>序号</th><th>人名</th><th style="width:160px">职位</th><th>公司名</th><th>公司评级</th><th>综合排名</th><th>打招呼信息</th><th>领英链接</th></tr></thead><tbody>
+          {% for person in candidates %}<tr id="candidate-{{ person.source_record_id }}" data-source-record-id="{{ person.source_record_id }}"><td><input class="single-confirm" type="checkbox" aria-label="确认 {{ person.name }} 已建联" /></td><td>{{ loop.index }}</td><td>{{ person.name }}</td><td title="{{ person.position }}" style="width:160px;max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ person.position }}</td><td>{{ person.company }}</td><td>{{ person.rating }}</td><td>{{ person.composite_rank }} · {{ person.composite_score }}</td><td>{{ person.greeting }}</td><td><a class="text-link linkedin-profile-link" href="{{ person.linkedin_profile }}" target="_blank" rel="noopener">打开</a></td></tr>{% else %}<tr><td colspan="9">暂无可建联联系人。</td></tr>{% endfor %}
+          </tbody></table></div>
+        </section>
+  <section class="panel"><h2>已确认记录</h2><small>共 {{ confirmed_total }} 条；第 {{ confirmed_page }} / {{ confirmed_page_count }} 页，每页 10 条。</small><div class="table-wrap"><table><thead><tr><th>人名</th><th>公司</th><th>职位</th><th>打招呼信息</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for person in confirmed %}<tr><td>{{ person.name }}</td><td>{{ person.company }}</td><td>{{ person.position }}</td><td>{{ person.greeting }}</td><td>{{ person.status }}</td><td>{% if person.can_restore %}<button class="restore-confirmed secondary" type="button" data-source-record-id="{{ person.source_record_id }}">撤销误标</button>{% else %}-{% endif %}</td></tr>{% else %}<tr><td colspan="6">暂无已确认记录。</td></tr>{% endfor %}</tbody></table></div>{% if confirmed_page_count > 1 %}<div class="inline-actions">{% if confirmed_page > 1 %}<a class="button secondary" href="/linkedin-connections?query={{ query|urlencode }}&batch_size={{ batch_size }}&page={{ confirmed_page - 1 }}">上一页</a>{% endif %}<span>第 {{ confirmed_page }} / {{ confirmed_page_count }} 页</span>{% if confirmed_page < confirmed_page_count %}<a class="button secondary" href="/linkedin-connections?query={{ query|urlencode }}&batch_size={{ batch_size }}&page={{ confirmed_page + 1 }}">下一页</a>{% endif %}</div>{% endif %}</section>
+</section></main>    <script id="candidate-source-record-ids" type="application/json">{{ candidates | map(attribute='source_record_id') | list | tojson }}</script>
+    <script>
+      const batchSize = {{ batch_size | tojson }};
+      const candidateIds = JSON.parse(document.getElementById("candidate-source-record-ids").textContent);
+      const feedback = document.getElementById("linkedin-feedback");
+      const peopleMetric = document.getElementById("dashboard-people");
+
+      function showFeedback(message, isError = false) { feedback.hidden = false; feedback.textContent = message; feedback.style.background = isError ? "#fee2e2" : ""; }
+      function updateMetrics(metrics) { if (metrics) peopleMetric.textContent = `${metrics.people} 人`; }
+      function markConfirmed(ids, mode) {
+        ids.forEach((id) => {
+          const row = document.getElementById(`candidate-${id}`); if (!row) return;
+          row.classList.add("linkedin-confirmed-row");
+          const checkbox = row.querySelector(".single-confirm"); checkbox.checked = true; checkbox.disabled = false;
+        });
+        if (candidateIds.every((id) => document.getElementById(`candidate-${id}`)?.classList.contains("linkedin-confirmed-row"))) {
+          const query = document.getElementById("candidate-query").value;
+          window.location.assign(`/linkedin-connections?batch_size=${encodeURIComponent(batchSize)}&query=${encodeURIComponent(query)}`);
+        } else showFeedback(`已记录 ${ids.length} 人的建联确认。再次取消勾选可还原误标。`);
+      }
+      async function confirmRecords(ids, mode) {
+        const unconfirmed = ids.filter((id) => !document.getElementById(`candidate-${id}`)?.classList.contains("linkedin-confirmed-row"));
+        if (!unconfirmed.length) return;
+        const body = new URLSearchParams({ batch_size: batchSize }); unconfirmed.forEach((id) => body.append("source_record_ids", id));
+        const response = await fetch("/linkedin-connections/confirm", { method: "POST", headers: { "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" }, body });
+        const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || "确认失败"); updateMetrics(result.metrics); markConfirmed(result.changed, mode);
+      }
+      async function restoreRecord(row) {
+        const id = row.dataset.sourceRecordId;
+        const response = await fetch(`/linkedin-connections/${encodeURIComponent(id)}/restore`, { method: "POST", headers: { "Accept": "application/json" } });
+        const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || "还原失败");
+        row.classList.remove("linkedin-confirmed-row");
+        const checkbox = row.querySelector(".single-confirm"); checkbox.checked = false; checkbox.disabled = false;
+        updateMetrics(result.metrics);
+        showFeedback("已还原误标。", false);
+      }
+      let busy = false;
+      function setBusy(value) {
+        busy = value;
+        document.querySelectorAll(".single-confirm, .restore-confirmed").forEach((checkbox) => { checkbox.disabled = value; });
+        document.getElementById("confirm-batch").disabled = value || candidateIds.length === 0;
+      }
+      document.querySelectorAll(".single-confirm").forEach((checkbox) => checkbox.addEventListener("change", async (event) => {
+        if (busy) return;
+        const row = event.target.closest("tr");
+        setBusy(true);
+        try {
+          if (event.target.checked) await confirmRecords([row.dataset.sourceRecordId], "single");
+          else await restoreRecord(row);
+        } catch (error) {
+          event.target.checked = row.classList.contains("linkedin-confirmed-row");
+          showFeedback(error.message, true);
+        } finally { setBusy(false); }
+      }));
+      document.getElementById("confirm-batch").addEventListener("click", async () => {
+        if (busy) return;
+        setBusy(true);
+        try { await confirmRecords(candidateIds, "batch"); }
+        catch (error) { showFeedback(error.message, true); }
+        finally { setBusy(false); }
+      });
+      document.querySelectorAll(".restore-confirmed").forEach((button) => button.addEventListener("click", async () => {
+        if (busy) return;
+        setBusy(true);
+        try {
+          const response = await fetch(`/linkedin-connections/${encodeURIComponent(button.dataset.sourceRecordId)}/restore`, { method: "POST", headers: { "Accept": "application/json" } });
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || "还原失败");
+          updateMetrics(result.metrics);
+          const query = document.getElementById("candidate-query").value;
+          window.location.assign(`/linkedin-connections?batch_size=${encodeURIComponent(batchSize)}&query=${encodeURIComponent(query)}`);
+        } catch (error) { showFeedback(error.message, true); }
+        finally { setBusy(false); }
+      }));
+      setBusy(false);
+      document.querySelectorAll(".linkedin-profile-link").forEach((link) => { const key = `linkedin-opened-profile:${link.href}`; if (localStorage.getItem(key)) link.classList.add("is-opened"); link.addEventListener("click", () => { localStorage.setItem(key, "1"); link.classList.add("is-opened"); }); });
+    </script>
+</body></html>

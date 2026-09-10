@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 from dataclasses import dataclass
 from io import BytesIO
@@ -344,8 +344,7 @@ def _get_or_create_contact(
 
     changed = False
     if contact.company_id != company.id:
-        contact.company_id = company.id
-        changed = True
+        raise ValueError(f"Email {primary_email} already belongs to another company; resolve the conflict before importing.")
     if full_name and contact.full_name != full_name and contact.full_name == "Team":
         contact.full_name = full_name
         contact.first_name = full_name.split(" ")[0]
@@ -576,6 +575,7 @@ def _import_normalized_rows(
     session.commit()
     return report
 
+
 def _row_values(
     ws,
     merged_lookup: dict[tuple[int, int], object],
@@ -587,6 +587,9 @@ def _row_values(
         canonical: _cell_text(ws, merged_lookup, row_idx, col_idx)
         for canonical, col_idx in plan.columns.items()
     }
+    company_name = row_data.get("company", "").strip()
+    if company_name and company_name.casefold() != carry.get("company", "").strip().casefold():
+        carry.clear()
     for key in FILL_DOWN_COLUMNS:
         if row_data.get(key):
             carry[key] = row_data[key]
@@ -737,3 +740,4 @@ def import_bd_json_candidates(session: Session, payload: bytes, filename: str = 
     report["source_system"] = _json_text(data.get("source_system"))
     report["selection_rule"] = _json_text(data.get("selection_rule"))
     return report
+

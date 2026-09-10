@@ -1,105 +1,47 @@
-# 海外营销 Workbench
+# BD Email Workbench
 
-海外营销 Workbench（Overseas Marketing Workbench）是一套面向海外客户开发的本地邮件自动化工作台。它把客户信息、邮件模板、发送安排、风险控制和结果记录连接成一条可预览、可确认、可持续执行、可追溯的工作流。
+这是可在 Windows 本地运行的干净生产分享包。它通过本地队列完成 SMTP 发信、发送节奏控制、记录、邮箱风险检查、退信抑制和 NO-GO 管理；不需要 AI 会话持续运行。
 
-## 推荐方式：Codex 操作，Workbench 执行
+## v5.03 发布包说明
 
-使用者只需要用自然语言说明目标，Codex 负责理解需求、整理客户范围、选择模板和发件身份、安排发送节奏，并在执行前展示需要确认的内容；确认后的任务交给 Workbench 本地队列持续运行，不要求 Codex 会话在每封邮件发送期间保持在线。
+2026-09-10 更新：修复收件人和 CC 保持、队列暂停/取消、每日额度、发送结果未明、退信历史保留、SQLite 备份和 LinkedIn 确认还原；首页预览按需加载。公开包不含客户数据或运营者身份；NO-GO 反馈邮件需先配置 `WORKBENCH_NOGO_FEEDBACK_TO`，内部包沿用内部反馈目标。
 
-- **Codex 负责理解与编排：**整理客户、内容、发件邮箱、发送窗口和执行计划。
-- **使用者负责确认：**检查客户对象、主题、正文、签名、发件身份、节奏和队列数量。
-- **Workbench 负责执行：**按照本地规则处理队列、随机间隔、时间窗口、多邮箱上限和发送记录。
-- **Skills 负责保持操作一致：**让 Codex 每次沿用同一套检查、发送、收件箱和退信处理流程。
 
-## 核心能力
+- `Overseas_Marketing_Workbench_v5.03_Production_Clean.zip`：对外干净分享包，不含任何 SQLite 数据库。
+- `Overseas_Marketing_Workbench_v5.03_Internal_LinkedIn_NoGo_Seed.zip`：内部种子包，含默认 LinkedIn 联系人主库（100 家脱敏的初始已建联联系人）、永久邮箱级抑制和已确认客户域名级 NO-GO；不得对外分发。
+- 两个包均附带 10 个 Workbench Skills，其中包含 LinkedIn 采集与招呼语处理流程。
 
-- **客户与触达信息统一管理：**集中记录公司、联系人、区域、状态和历史触达，减少重复处理。
-- **模板复用与个性化：**保存富文本模板、图片和格式，并使用公司名、联系人、国家、区域等字段生成个性化内容。
-- **多邮箱与发送节奏控制：**支持多邮箱轮发、单邮箱每日上限、随机发送间隔和指定时间窗口。
-- **本地队列持续执行：**任务一次安排后由本地工作台继续运行，不依赖 AI 会话持续在线。
-- **发送前风险检查：**检查异常邮箱、重复企业域名、抑制记录、NO-GO、签名和模板渲染结果。
-- **退信与收件箱处理：**检查回复、退信、自动回复和邮箱变更线索，并维护不可继续触达的邮箱路线。
-- **发送记录沉淀：**保留草稿、队列、发送时间和结果证据，为后续跟进、复盘和节奏调整提供依据。
+## 计划器安全规则
 
-## 推荐工作流
-
-1. 使用者说明本轮客户开发目标、区域、产品方向和期望节奏。
-2. Codex 读取已有客户与触达信息，整理候选范围并检查明显风险。
-3. 选择模板、签名和发件邮箱，生成待审核草稿。
-4. 完整预览客户、主题、正文、发件身份、发送窗口和队列数量。
-5. 使用者明确确认后，Workbench 接管任务并按照本地规则执行。
-6. 根据发送记录、退信和回复证据安排跟进，或更新抑制与 NO-GO 信息。
-
-## 随包 7 个 Skills
-
-| Skill | 用途 | 适合什么时候使用 |
-| --- | --- | --- |
-| `$workbench-first-run-check` | 检查运行环境、旧版本、发件邮箱、签名和 Skills 安装状态 | 新电脑首次配置，或已有旧版本需要原地升级时 |
-| `$workbench-email-daily-runbook` | 日常操作总入口，根据任务自动路由到更专业的 Workbench Skill | 需求涉及客户、草稿、队列、发送、收件箱或参数等多个环节时 |
-| `$workbench-send-mail` | 准备、预览、确认、释放发送并核对 `sendrecord` | 单封邮件、内部测试或已确认批次的正式发送与结果核验 |
-| `$workbench-inbox-check` | 只读检查发件邮箱中的回复、退信、自动回复和投递通知 | 查看客户是否回复，或寻找退信和邮箱变更线索时 |
-| `$email-bounce-suppression` | 预览并处理退信、自动回复、离职或邮箱变更，维护 suppression | 确认无效邮箱、替换联系人路线或防止后续重复发送时 |
-| `$workbench-queue-builder` | 把已经确认的批次交给 Workbench 原生队列，并检查队列已恢复运行 | 客户范围和内容已经确认，需要安排区域批次或延时发送时 |
-| `$workbench-parameter-tuner` | 查看或调整每日上限、发送窗口、随机间隔、追踪开关、邮箱状态和队列暂停状态 | 需要调整日常运行参数，但不直接创建或发送邮件时 |
-
-## 建议维护两个 Codex 长期任务
-
-安装 Skills 后，建议分别建立两个长期任务。这样客户开发和收件箱处理不会混在同一段上下文中，Codex 也能持续沿用固定工作流。
-
-### 自动化营销工作台
-
-这个任务负责客户筛选、草稿、模板、发送计划、队列和发送记录。以 `$workbench-email-daily-runbook` 为总入口，并按需要调用 queue、send 和 parameter Skills。
-
-建议用下面这句话开始任务：
-
-```text
-请把这个任务作为“自动化营销工作台”长期维护。默认使用 $workbench-email-daily-runbook 理解和路由我的需求；涉及批次安排时使用 $workbench-queue-builder，涉及发送和结果核验时使用 $workbench-send-mail，涉及运行参数时使用 $workbench-parameter-tuner。所有真实发送先完整预览并等待我确认，以 Workbench 数据库、队列和 sendrecord 作为最终状态依据。
-```
-
-### 收件箱处理助手
-
-这个任务负责检查回复、退信、自动回复、邮箱变更和 suppression。默认先用 `$workbench-inbox-check` 做只读检查；确认需要处理的退信或无效路线后，再使用 `$email-bounce-suppression`。
-
-建议用下面这句话开始任务：
-
-```text
-请把这个任务作为“收件箱处理助手”长期维护。默认使用 $workbench-inbox-check 只读检查发件邮箱中的客户回复、退信、自动回复和投递通知；需要处理无效邮箱、离职或邮箱变更时，使用 $email-bounce-suppression 先预览再执行。不要自动发送客户回复，也不要删除公司或联系人记录。
-```
-
-长期任务负责保持上下文和操作习惯；真实业务状态仍以 Workbench 的数据库、队列、收件箱证据和 `sendrecord` 为准。
+内置 `/planner` 只读预排：不会创建草稿、入队或发送邮件。模板轮换前会排除公司成功发送后 48 小时冷却、所选精确主收件人成功发送后 7 天冷却，以及来源为 `success_locked` 的联系人；三个原因分别返回，不能被“可入队”总数掩盖。
 
 ## 第一次使用
 
-1. 安装 Python 3，并确保 Windows 可以使用 `py -3`、`python` 或 `python3` 命令。
-2. 从 [GitHub Releases](https://github.com/WJY0413/overseas-marketing-workbench/releases) 下载并解压最新版本。
-3. 阅读 `FIRST_START.md`，双击 `install_skills.cmd`。
-4. 重启 Codex，发送：`请使用 $workbench-first-run-check 检查并完成海外营销 Workbench 首次配置。`
-5. 未发现旧版本时双击 `start.cmd`；发现一个旧版本时按检查结果原地升级；发现多个版本时先指定唯一主版本。
-6. 在页面中配置至少一个可用 SMTP 邮箱，并保存、预览个性化签名。
+1. 无需预先手动配置 Python。首次启动自动检测 PATH、Python Launcher 和 Windows 注册表中的稳定版 CPython 3.11+，优先选择本机较新版本，支持 Python 3.14。
+2. 解压后先阅读 `FIRST_START.md`，双击 `install_skills.cmd`。
+3. 重启 Codex，发送：`请使用 $workbench-first-run-check 检查并完成海外营销 Workbench 首次配置。`
+4. 未发现旧版本时双击 `start.cmd`；发现一个旧版本时按检查结果原地升级；发现多个版本时先指定唯一主版本。
+5. 在页面中配置至少一个可用 SMTP 邮箱，并保存、预览个性化签名。
 
 `start.cmd` 会创建 `.env`、`.venv` 和新的本地 SQLite 数据库，然后启动 `http://127.0.0.1:8001`。
 
+## 安全默认值
+
+- `DRY_RUN_EMAIL=true`
+- `ENABLE_OPEN_TRACKING=false`
+- 不含真实 SMTP 密码、发送记录、日志、备份或真实签名；对外干净包不含数据库，内部种子包仅含脱敏 LinkedIn 主库与 NO-GO 种子库。
+- 实际发送前仍需检查发件人、收件人、模板、签名、抑制状态、NO-GO 和队列。
+
 ## 已有版本升级
 
-不要把新版作为第二套软件启动。先让 `$workbench-first-run-check` 确认唯一旧版本，再预览：
+不要把新版作为第二套软件启动。先让 `$workbench-first-run-check` 确认唯一旧版本，关闭该版本并确认它的本地端口已经停止监听，再预览：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\update_existing_workbench.ps1 -TargetRoot "<existing-workbench-root>"
 ```
 
-确认目标后增加 `-Apply`。脚本保留 `.env`、`.venv`、`data/`、数据库、邮箱凭据、签名、发送记录、报告和备份，并把被替换的程序文件备份到旧版本的 `code_backups/`。
+确认目标后增加 `-Apply`。若目标目录声明的 Workbench 端口仍在监听，脚本会在复制任何文件前拒绝更新，防止旧进程加载新模板形成混合版本。脚本保留 `.env`、`.venv`、`data/`、数据库、邮箱凭据、签名、发送记录、报告和备份，并把被替换的程序文件备份到旧版本的 `code_backups/`；更新完成后再从目标目录启动 Workbench。
 
-## 安全与状态边界
+## 随包 Skills
 
-- 真实对外发送必须经过人工确认，确认范围包括客户、模板、发件邮箱、抄送规则、发送节奏和队列数量。
-- 风险规则不能被旧草稿绕过；实际发送前仍需检查抑制、NO-GO、重复触达和内容完整性。
-- 已生成草稿不等于已排队，已排队不等于已发送，SMTP 接受也不等于客户最终收到或阅读。
-- Workbench 是辅助销售执行的工具，不替代客户选择、内容判断和对外沟通责任。
-
-## 适用场景
-
-它适合需要同时管理一批客户、内容版本、发件身份、发送节奏和风险边界的海外客户开发。如果只是给单个客户临时发送一封高度个性化邮件，直接使用日常邮箱通常更快。
-
-## License
-
-本项目采用 [MIT License](LICENSE)。
+压缩包包含 10 个 Workbench Skills：首次启动检查、批次计划器、每日路由、邮件发送、收件箱检查、退信抑制、队列构建、参数调整、LinkedIn 采集与 LinkedIn 招呼语处理。安装器只更新同名目录并先备份；检测到 `copy`、`old`、`(1)` 等重复目录时会停止。
