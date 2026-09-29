@@ -7,7 +7,7 @@ import sqlite3
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from app.services.domain_normalization import normalize_domain as _normalized_domain
 from uuid import uuid4
 
 from sqlalchemy import Engine, func
@@ -86,15 +86,6 @@ def _text(value: object) -> str:
 
 def _normalized_name(value: object) -> str:
     return " ".join(_text(value).casefold().split())
-
-
-def _normalized_domain(value: object) -> str:
-    raw = _text(value).casefold()
-    if not raw:
-        return ""
-    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
-    host = (parsed.hostname or parsed.path.split("/", 1)[0]).strip(".")
-    return host[4:] if host.startswith("www.") else host
 
 
 def _emails(value: object) -> list[str]:

@@ -1,12 +1,12 @@
-# Overseas Marketing Workbench v5.03
+# Overseas Marketing Workbench v5.04
 
-Released 2026-09-10 after review and test acceptance.
+Released 2026-09-29.
 
-This release preserves approved recipients and CC rules through queue handoff, applies sender/contact checks at delivery time, and makes pause/cancel and daily capacity scheduling consistent. Uncertain or partially accepted deliveries remain visible for verification instead of being blindly retried.
+This maintenance release retains the v5.03 application behavior and extracts the existing domain normalization helper without changing its matching rules. The private, read-only domain-history one-shot workflow is installed only in the operator's local workspace; it is not part of this public package.
 
-It also preserves historic evidence during bounce cleanup, validates TLS certificates, fixes SQLite backup and migration paths, and improves LinkedIn confirmation, restore and paging. Homepage previews now load on demand in a sandbox. The package includes 10 Workbench Skills.
+The package includes 10 Workbench Skills. Existing sender settings, queue, database, and local credentials remain operator-owned during an in-place upgrade.
 
-Validation of the reviewed application: 169 unittest cases passed with one Python-version skip, five helper tests and two Node behavior suites passed. The v5.03 packages passed archive/content checks and clean import smoke validation. Real outbound transport and full browser visual checks were not part of release validation.
+Validation: 38 domain-history regression tests passed in the internal source tree. The public Clean and Pure Empty archives passed package checks and a clean import smoke check. No real email was sent during validation.
 
 ## Downloads
 
