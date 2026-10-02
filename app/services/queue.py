@@ -14,7 +14,7 @@ from app.services.email_quality import validate_contact_email
 from app.services.feishu_native_reply import is_native_reply_draft, native_reply_metadata, send_queued_native_reply
 from app.services.app_settings import is_queue_paused, set_app_setting
 from app.services.mailer import send_draft
-from app.services.delivery_outcome import DeliveryUncertainError
+from app.services.delivery_outcome import DeliveryUncertainError, PreSendBlockedError
 from app.services.mailer import validate_attachment_paths
 from app.services.no_go_companies import is_no_go_company
 from app.services.render_validation import (
@@ -213,6 +213,18 @@ def audit_draft(session: Session, draft: EmailDraft) -> list[str]:
     contact = session.get(Contact, draft.contact_id)
     company = session.get(Company, draft.company_id)
     issues: list[str] = []
+    if draft.status in {"queued", "sending"}:
+        try:
+            snapshot = json.loads(draft.template_snapshot or "{}")
+        except (TypeError, ValueError):
+            snapshot = {}
+        approved_email = snapshot.get("queued_recipient_email") if isinstance(snapshot, dict) else None
+        current_email = (contact.email or "").strip().casefold() if contact else None
+        if not approved_email or approved_email != current_email:
+            issues.append("Queued recipient changed or has no frozen address; cancel, review and requeue.")
+    for cc_email in _cc_recipients(draft.cc_emails):
+        if _active_suppression_for_email(session, cc_email):
+            issues.append(f"CC recipient is in suppression list: {cc_email}")
     rendered_field_issues = rendered_message_field_issues(
         subject=draft.subject,
         body_html=draft.body_html,
@@ -645,6 +657,14 @@ def queue_draft(
             session.commit()
         raise ValueError(draft.error_message)
     planned_at = scheduled_at or _next_global_queue_slot(session, sender)
+    try:
+        snapshot = json.loads(draft.template_snapshot or "{}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid draft snapshot; review the draft before queueing.") from exc
+    if not isinstance(snapshot, dict):
+        raise ValueError("Invalid draft snapshot; review the draft before queueing.")
+    snapshot["queued_recipient_email"] = (contact.email or "").strip().casefold()
+    draft.template_snapshot = json.dumps(snapshot, ensure_ascii=False)
     draft.sender_account_id = sender.id
     draft.status = "queued"
     draft.scheduled_at = planned_at
@@ -897,6 +917,15 @@ def _inside_sender_window(sender: SenderAccount, now: datetime) -> bool:
     return any(_is_time_inside_window(local, window_start, window_end) for window_start, window_end in sender_windows(sender))
 
 
+def _delivery_state(draft: EmailDraft, sender: SenderAccount, contact: Contact) -> tuple:
+    """Fields used to prepare the outgoing message; never logged."""
+    return (
+        draft.company_id, draft.contact_id, draft.sender_account_id,
+        draft.subject, draft.body_html, draft.body_text, draft.cc_emails,
+        draft.attachment_paths, draft.template_snapshot, contact.email, sender.email,
+    )
+
+
 def process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] | None = None) -> dict[str, int | bool]:
     """Run one process-wide, globally serialized outbound queue pass."""
     if not QUEUE_PROCESSING_LOCK.acquire(blocking=False):
@@ -927,6 +956,9 @@ def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] |
     deferred_sender_ids: set[int] = set()
 
     for draft in due:
+        session.refresh(draft)
+        if draft.status != "queued":
+            continue
         sender = session.get(SenderAccount, draft.sender_account_id) if draft.sender_account_id else None
         contact = session.get(Contact, draft.contact_id)
         if sender is None or contact is None:
@@ -1003,15 +1035,33 @@ def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] |
                     metadata_json=json.dumps({"recipient_email": contact.email, "sender_email": sender.email})))
                 session.commit()
                 delivery_accepted = False
+                # The sending intent is committed. The final callback discards
+                # only subsequent reads, then checks fresh state before delivery.
+                expected_delivery = _delivery_state(draft, sender, contact)
+
+                def before_send():
+                    session.rollback()
+                    if session.get(EmailDraft, draft.id) is None:
+                        raise PreSendBlockedError("Draft disappeared before delivery.")
+                    session.refresh(draft)
+                    session.refresh(sender)
+                    session.refresh(contact)
+                    if draft.status != "sending" or _delivery_state(draft, sender, contact) != expected_delivery:
+                        raise PreSendBlockedError("Queued delivery fields changed; review before requeueing.")
+                    issues = audit_draft(session, draft)
+                    if issues:
+                        raise PreSendBlockedError("; ".join(issues))
+
                 try:
                     native_reply_result = None
                     if get_settings().dry_run_email:
+                        before_send()
                         send_result = "simulated"
                     elif is_native_reply:
-                        native_reply_result = send_queued_native_reply(draft, sender, contact)
+                        native_reply_result = send_queued_native_reply(draft, sender, contact, before_send=before_send)
                         send_result = "sent"
                     else:
-                        send_result = send_draft(session, draft, sender)
+                        send_result = send_draft(session, draft, sender, before_send=before_send)
                     delivery_accepted = send_result == "sent"
                     now = utc_now()
                     draft.status = "sent" if send_result == "sent" else "simulated"
@@ -1080,6 +1130,18 @@ def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] |
                                 },
                                 ensure_ascii=False,
                             )
+                except PreSendBlockedError as exc:
+                    # Never downgrade a concurrently observed terminal/unknown
+                    # outcome into a retryable draft.
+                    if draft.status == "sending":
+                        draft.status = "pending_review"
+                        draft.approved_at = None
+                        draft.sender_account_id = None
+                        draft.scheduled_at = None
+                        draft.error_message = str(exc)
+                    session.add(EmailEvent(draft_id=draft.id, event_type="pre_send_audit_blocked",
+                        metadata_json=str(exc)))
+                    failed += 1
                 except DeliveryUncertainError as exc:
                     draft.status = "send_unknown"
                     draft.error_message = str(exc)

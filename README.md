@@ -1,5 +1,9 @@
 # BD Email Workbench
 
+## 5.05 source candidate
+
+This branch contains focused queue safety fixes. Tests are provided but have not been run in the cloud task; this is not a production release or an MCP integration. See [5.05 scope, upgrade boundary and validation status](RELEASE_NOTES.md). Older download descriptions and checksum manifests below refer to historical packages.
+
 这是可在 Windows 本地运行的干净生产分享包。它通过本地队列完成 SMTP 发信、发送节奏控制、记录、邮箱风险检查、退信抑制和 NO-GO 管理；不需要 AI 会话持续运行。
 
 ## v5.03 发布包说明

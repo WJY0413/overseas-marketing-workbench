@@ -140,7 +140,7 @@ def _copy_attachments(paths: list[str], temp_dir: Path) -> list[str]:
     return copied
 
 
-def send_queued_native_reply(draft, sender, contact) -> dict:
+def send_queued_native_reply(draft, sender, contact, *, before_send=None) -> dict:
     """Send one already-approved reply through Feishu's native thread path."""
     metadata = native_reply_metadata(draft.template_snapshot)
     source_message_id = str(metadata.get("source_message_id") or "").strip()
@@ -183,6 +183,8 @@ def send_queued_native_reply(draft, sender, contact) -> dict:
             command.extend(["--cc", draft.cc_emails])
         if attachment_names:
             command.extend(["--attach", ",".join(attachment_names)])
+        if before_send is not None:
+            before_send()
         try:
             response = _run_lark(*command, cwd=temp_name)
         except Exception as exc:
