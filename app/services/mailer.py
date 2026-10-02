@@ -140,7 +140,7 @@ def _prepare_inline_images(body_html: str) -> tuple[str, list[dict[str, str | by
     return html, inline_images
 
 
-def send_draft(session: Session, draft: EmailDraft, sender: SenderAccount) -> str:
+def send_draft(session: Session, draft: EmailDraft, sender: SenderAccount, *, before_send=None) -> str:
     contact = session.get(Contact, draft.contact_id)
     if contact is None:
         raise RuntimeError("Contact not found.")
@@ -197,6 +197,8 @@ def send_draft(session: Session, draft: EmailDraft, sender: SenderAccount) -> st
             if sender.smtp_port != 465:
                 smtp.starttls(context=ssl.create_default_context())
             smtp.login(sender.smtp_username or sender.email, password)
+            if before_send is not None:
+                before_send()
             delivery_started = True
             refused = smtp.send_message(msg)
             if refused:

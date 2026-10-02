@@ -1569,46 +1569,54 @@ def update_draft_prep_contact(
     priority: str = Form("B"),
     session: Session = Depends(get_session),
 ):
-    contact = session.get(Contact, contact_id)
-    if contact is None:
-        return _redirect("Contact not found.")
-    email_check = validate_contact_email(email, check_deliverability=False)
-    normalized_email = email_check.normalized_email or email.strip().lower()
-    if email_check.is_blocking:
-        return _redirect("Please enter a valid email before saving.")
-    existing = session.exec(select(Contact).where(Contact.email == normalized_email, Contact.id != contact_id)).first()
-    if existing:
-        return _redirect("Another CRM contact already uses this email.")
-    company_name = company.strip()
-    previous_company = session.get(Company, contact.company_id)
-    if previous_company and previous_company.name != company_name:
-        has_history = session.exec(select(EmailDraft.id).where(EmailDraft.contact_id == contact.id).limit(1)).first() is not None
-        has_history = has_history or session.exec(select(SendRecord.id).where(SendRecord.contact_id == contact.id).limit(1)).first() is not None
-        if has_history:
-            return _redirect("Contact has draft/send history; resolve company reassignment separately.")
-    if not company_name or not full_name.strip():
-        return _redirect("Company and contact name are required.")
-    company_record = session.exec(select(Company).where(Company.name == company_name)).first()
-    if company_record is None:
-        company_record = Company(name=company_name)
+    with QUEUE_PROCESSING_LOCK:
+        session.expire_all()
+        contact = session.get(Contact, contact_id)
+        if contact is None:
+            return _redirect("Contact not found.")
+        email_check = validate_contact_email(email, check_deliverability=False)
+        normalized_email = email_check.normalized_email or email.strip().lower()
+        if email_check.is_blocking:
+            return _redirect("Please enter a valid email before saving.")
+        active_draft = session.exec(select(EmailDraft.id).where(
+            EmailDraft.contact_id == contact_id,
+            EmailDraft.status.in_(("queued", "sending", "send_unknown")),
+        ).limit(1)).first()
+        if active_draft is not None:
+            return _redirect("Contact has queued, sending or uncertain mail; resolve it before editing.")
+        existing = session.exec(select(Contact).where(Contact.email == normalized_email, Contact.id != contact_id)).first()
+        if existing:
+            return _redirect("Another CRM contact already uses this email.")
+        company_name = company.strip()
+        previous_company = session.get(Company, contact.company_id)
+        if previous_company and previous_company.name != company_name:
+            has_history = session.exec(select(EmailDraft.id).where(EmailDraft.contact_id == contact.id).limit(1)).first() is not None
+            has_history = has_history or session.exec(select(SendRecord.id).where(SendRecord.contact_id == contact.id).limit(1)).first() is not None
+            if has_history:
+                return _redirect("Contact has draft/send history; resolve company reassignment separately.")
+        if not company_name or not full_name.strip():
+            return _redirect("Company and contact name are required.")
+        company_record = session.exec(select(Company).where(Company.name == company_name)).first()
+        if company_record is None:
+            company_record = Company(name=company_name)
+            session.add(company_record)
+            session.commit()
+            session.refresh(company_record)
+        company_record.country = country.strip() or company_record.country
+        company_record.region = region.strip() or company_record.region
+        company_record.priority = priority.strip() or company_record.priority
+        company_record.updated_at = utc_now()
+        contact.company_id = company_record.id
+        contact.full_name = full_name.strip()
+        contact.first_name = contact.full_name.split(" ")[0]
+        contact.position = position.strip() or None
+        contact.email = normalized_email
+        contact.updated_at = utc_now()
         session.add(company_record)
+        session.add(contact)
+        _sync_primary_email_route(session, contact)
         session.commit()
-        session.refresh(company_record)
-    company_record.country = country.strip() or company_record.country
-    company_record.region = region.strip() or company_record.region
-    company_record.priority = priority.strip() or company_record.priority
-    company_record.updated_at = utc_now()
-    contact.company_id = company_record.id
-    contact.full_name = full_name.strip()
-    contact.first_name = contact.full_name.split(" ")[0]
-    contact.position = position.strip() or None
-    contact.email = normalized_email
-    contact.updated_at = utc_now()
-    session.add(company_record)
-    session.add(contact)
-    _sync_primary_email_route(session, contact)
-    session.commit()
-    return _redirect("Draft prep customer updated.")
+        return _redirect("Draft prep customer updated.")
 
 
 @app.get("/templates")
@@ -2223,31 +2231,33 @@ def update_draft_attachments(
     attachment_paths: str = Form(""),
     session: Session = Depends(get_session),
 ):
-    draft = session.get(EmailDraft, draft_id)
-    if draft is None or draft.status in {"sent", "simulated", "sending", "send_unknown"}:
-        return _redirect("Draft not found or already sent.")
-    draft.attachment_paths = serialize_attachment_paths(attachment_paths)
-    issues = audit_draft(session, draft)
-    if issues:
-        draft.status = "pending_review"
-        draft.error_message = "; ".join(issues)
-        draft.approved_at = None
-    elif draft.status == "pending_review":
-        draft.status = "approved"
-        draft.error_message = None
-        draft.approved_at = utc_now()
-    draft.updated_at = utc_now()
-    session.add(draft)
-    session.add(
-        EmailEvent(
-            draft_id=draft.id,
-            event_type="attachments_updated",
-            metadata_json=draft.attachment_paths,
+    with QUEUE_PROCESSING_LOCK:
+        session.expire_all()
+        draft = session.get(EmailDraft, draft_id)
+        if draft is None or draft.status in {"queued", "sent", "simulated", "sending", "send_unknown"}:
+            return _redirect("Draft is missing or locked for delivery; cancel queued mail before editing attachments.")
+        draft.attachment_paths = serialize_attachment_paths(attachment_paths)
+        issues = audit_draft(session, draft)
+        if issues:
+            draft.status = "pending_review"
+            draft.error_message = "; ".join(issues)
+            draft.approved_at = None
+        elif draft.status == "pending_review":
+            draft.status = "approved"
+            draft.error_message = None
+            draft.approved_at = utc_now()
+        draft.updated_at = utc_now()
+        session.add(draft)
+        session.add(
+            EmailEvent(
+                draft_id=draft.id,
+                event_type="attachments_updated",
+                metadata_json=draft.attachment_paths,
+            )
         )
-    )
-    session.commit()
-    count = len(parse_attachment_paths(draft.attachment_paths))
-    return _redirect(f"Draft attachment path(s) saved: {count}.")
+        session.commit()
+        count = len(parse_attachment_paths(draft.attachment_paths))
+        return _redirect(f"Draft attachment path(s) saved: {count}.")
 
 
 @app.post("/drafts/{draft_id}/queue")
@@ -2256,12 +2266,14 @@ def queue(
     sender_id: int = Form(...),
     session: Session = Depends(get_session),
 ):
-    try:
-        queue_draft(session, draft_id, sender_id)
-        sync_power_awake(session)
-        return _redirect("Draft queued.")
-    except ValueError as exc:
-        return _redirect(str(exc))
+    with QUEUE_PROCESSING_LOCK:
+        session.expire_all()
+        try:
+            queue_draft(session, draft_id, sender_id)
+            sync_power_awake(session)
+            return _redirect("Draft queued.")
+        except ValueError as exc:
+            return _redirect(str(exc))
 
 
 @app.post("/send/start")
@@ -2333,23 +2345,25 @@ def start_send_batch(
 
 @app.post("/queue/cancel")
 def cancel_queue_items(draft_ids: list[int] = Form(default=[]), session: Session = Depends(get_session)):
-    if not draft_ids:
-        return _redirect("Please select at least one queued draft to cancel.")
-    cancelled = 0
-    skipped = 0
-    for draft_id in draft_ids:
-        draft = session.get(EmailDraft, draft_id)
-        if draft is None or draft.status != "queued":
-            skipped += 1
-            continue
-        try:
-            cancel_queued_draft(session, draft)
-            cancelled += 1
-        except ValueError:
-            skipped += 1
-    session.commit()
-    sync_power_awake(session)
-    return _redirect(f"Cancelled queued draft(s): {cancelled}. Skipped: {skipped}.")
+    with QUEUE_PROCESSING_LOCK:
+        session.expire_all()
+        if not draft_ids:
+            return _redirect("Please select at least one queued draft to cancel.")
+        cancelled = 0
+        skipped = 0
+        for draft_id in draft_ids:
+            draft = session.get(EmailDraft, draft_id)
+            if draft is None or draft.status != "queued":
+                skipped += 1
+                continue
+            try:
+                cancel_queued_draft(session, draft)
+                cancelled += 1
+            except ValueError:
+                skipped += 1
+        session.commit()
+        sync_power_awake(session)
+        return _redirect(f"Cancelled queued draft(s): {cancelled}. Skipped: {skipped}.")
 
 
 @app.post("/queue/cancel-all")
