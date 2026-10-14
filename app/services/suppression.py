@@ -1,13 +1,17 @@
 from datetime import datetime
 
 from app.models import Suppression
-from app.time_utils import as_utc, utc_now
+from app.time_utils import as_utc, persisted_utc, utc_now
 
 
 def is_active_suppression(item: Suppression, now: datetime | None = None) -> bool:
-    """Return whether a permanent or unexpired suppression blocks sending."""
-    expires_at = as_utc(item.expires_at)
-    return expires_at is None or expires_at > (now or utc_now())
+    """Honor explicit UTC instants; never shorten an ambiguous legacy expiry."""
+    expires_at = persisted_utc(item.expires_at)
+    if item.expires_at is not None and item.expires_at.tzinfo is None:
+        # Old rows have no timezone provenance. Keep the later UTC/local
+        # interpretation rather than releasing a previously active rule early.
+        expires_at = max(expires_at, as_utc(item.expires_at))
+    return expires_at is None or expires_at > persisted_utc(now or utc_now())
 
 
 def suppression_matches_email(item: Suppression, email: str | None) -> bool:

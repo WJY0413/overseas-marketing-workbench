@@ -21,7 +21,12 @@ class QueueState(TypedDict):
 
 
 def reconcile_queue_state(session: Session, commit: bool = True) -> QueueState:
-    queued_count = session.exec(select(func.count(EmailDraft.id)).where(EmailDraft.status == "queued")).one()
+    counts = dict(session.exec(select(EmailDraft.status, func.count(EmailDraft.id)).where(
+        EmailDraft.status.in_(("queued", "sending", "send_unknown"))
+    ).group_by(EmailDraft.status)).all())
+    queued_count = counts.get("queued", 0)
+    sending_count = counts.get("sending", 0)
+    unknown_count = counts.get("send_unknown", 0)
     pending_handoffs = session.exec(select(func.count(QueueHandoffRun.id)).where(
         QueueHandoffRun.status.in_(("pending", "running")))).one()
     paused = is_queue_paused(session)
@@ -34,7 +39,18 @@ def reconcile_queue_state(session: Session, commit: bool = True) -> QueueState:
         sender = session.get(SenderAccount, next_draft.sender_account_id)
         sender_email = sender.email if sender else None
 
-    if queued_count == 0 and pending_handoffs == 0:
+    has_queue = queued_count > 0 or pending_handoffs > 0 or sending_count > 0
+    if sending_count:
+        status = "running"
+        label = "发送中（后续已暂停）" if paused else "发送中"
+        button_label = "继续发送" if paused else "停止发送"
+        action_url = "/queue/resume" if paused else "/queue/pause"
+    elif not has_queue and unknown_count:
+        status = "verification_required"
+        label = "待核验发送结果"
+        button_label = "开始发送"
+        action_url = "/send/start"
+    elif not has_queue:
         status = "idle"
         label = "未开始"
         button_label = "开始发送"
@@ -50,6 +66,9 @@ def reconcile_queue_state(session: Session, commit: bool = True) -> QueueState:
         button_label = "停止发送"
         action_url = "/queue/pause"
 
+    if unknown_count and has_queue:
+        label += "（含待核验）"
+
     return {
         "status": status,
         "label": label,
@@ -59,5 +78,5 @@ def reconcile_queue_state(session: Session, commit: bool = True) -> QueueState:
         "next_scheduled_at": next_draft.scheduled_at if next_draft else None,
         "sender_email": sender_email,
         "is_paused": paused,
-        "has_queue": queued_count > 0 or pending_handoffs > 0,
+        "has_queue": has_queue,
     }

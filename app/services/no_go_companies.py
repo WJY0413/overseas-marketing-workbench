@@ -3,7 +3,6 @@ import re
 from io import BytesIO, StringIO
 from pathlib import Path
 
-from openpyxl import load_workbook
 from sqlmodel import Session, select
 
 from app.models import Company
@@ -93,6 +92,9 @@ def parse_no_go_company_file(payload: bytes, filename: str) -> list[str]:
         rows = [list(row) for row in csv.reader(StringIO(text), dialect)]
         return _names_from_rows(rows)
     if suffix in {".xlsx", ".xlsm"}:
+        # Ordinary blacklist checks and text imports do not need Excel/NumPy.
+        from openpyxl import load_workbook
+
         workbook = load_workbook(BytesIO(payload), read_only=True, data_only=True)
         names: list[str] = []
         try:

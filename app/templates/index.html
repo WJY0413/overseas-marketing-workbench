@@ -333,7 +333,7 @@
               </div>
               <div class="start-step start-action">
                 <strong>3</strong>
-                {% if queue_state.status == "idle" %}
+                {% if queue_state.status in ("idle", "verification_required") %}
                   <button class="start-button" type="submit">{{ queue_state.button_label }}</button>
                 {% else %}
                   <button class="start-button" type="submit" form="queue-state-action-form">{{ queue_state.button_label }}</button>

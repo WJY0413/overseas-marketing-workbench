@@ -34,9 +34,8 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_SEND_INTERVAL_SECONDS = 30
 RECENT_DUPLICATE_SEND_HOURS = 24
 NATIVE_REPLY_GLOBAL_MIN_INTERVAL_SECONDS = 45
-# Both sending and intake mutate the same SQLite queue.  One in-process gate
-# makes their write ownership explicit; database busy_timeout covers a second
-# process or a transient external reader/writer.
+# Sending, intake, cancellation and generation share one process-wide boundary.
+# This is not a cross-process claim; SQLite busy_timeout only waits for writers.
 QUEUE_PROCESSING_LOCK = Lock()
 QUEUE_HANDOFF_BATCH_SIZE = 50
 SHARED_RECIPIENT_DOMAINS = {
@@ -138,6 +137,7 @@ def _active_suppression_for_email(session: Session, email: str | None) -> Suppre
     domain = normalized.rsplit("@", 1)[-1]
     candidates = session.exec(
         select(Suppression).where(func.lower(Suppression.email).in_([normalized, f"@{domain}"]))
+        .execution_options(populate_existing=True)
     ).all()
     return next((item for item in candidates if suppression_matches_email(item, normalized)), None)
 
@@ -592,7 +592,22 @@ def queue_draft(
     refresh_before_queue: bool = True,
     audit_before_queue: bool = True,
 ) -> EmailDraft:
-    draft = session.get(EmailDraft, draft_id)
+    with QUEUE_PROCESSING_LOCK:
+        return _queue_draft_locked(session, draft_id, sender_id, scheduled_at, commit,
+                                   allow_recent_duplicate, refresh_before_queue, audit_before_queue)
+
+
+def _queue_draft_locked(
+    session: Session,
+    draft_id: int,
+    sender_id: int,
+    scheduled_at: datetime | None = None,
+    commit: bool = True,
+    allow_recent_duplicate: bool = False,
+    refresh_before_queue: bool = True,
+    audit_before_queue: bool = True,
+) -> EmailDraft:
+    draft = session.get(EmailDraft, draft_id, populate_existing=True)
     sender = session.get(SenderAccount, sender_id)
     if draft is None or sender is None:
         raise ValueError("Draft or sender not found.")
@@ -748,7 +763,7 @@ def process_next_queue_handoff_batch(session: Session, handoff_id: str | None = 
         queued = 0
         excluded = 0
         for offset, draft_id in enumerate(chunk):
-            draft = session.get(EmailDraft, draft_id)
+            draft = session.get(EmailDraft, draft_id, populate_existing=True)
             sender_id = sender_ids[(start + offset) % len(sender_ids)]
             sender = session.get(SenderAccount, sender_id)
             if draft is None or sender is None or not sender.is_active:
@@ -794,7 +809,7 @@ def process_next_queue_handoff_batch(session: Session, handoff_id: str | None = 
                 draft.approved_at = utc_now()
                 draft.error_message = None
                 session.add(draft)
-                queue_draft(
+                _queue_draft_locked(
                     session,
                     draft.id,
                     sender.id,
@@ -916,6 +931,7 @@ def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] |
         .where(EmailDraft.status == "queued", EmailDraft.scheduled_at <= utc_now())
         .order_by(EmailDraft.scheduled_at, EmailDraft.id)
         .limit(limit)
+        .execution_options(populate_existing=True)
     )
     if draft_ids:
         statement = statement.where(EmailDraft.id.in_(draft_ids))
@@ -927,8 +943,8 @@ def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] |
     deferred_sender_ids: set[int] = set()
 
     for draft in due:
-        sender = session.get(SenderAccount, draft.sender_account_id) if draft.sender_account_id else None
-        contact = session.get(Contact, draft.contact_id)
+        sender = session.get(SenderAccount, draft.sender_account_id, populate_existing=True) if draft.sender_account_id else None
+        contact = session.get(Contact, draft.contact_id, populate_existing=True)
         if sender is None or contact is None:
             draft.status = "failed"
             draft.error_message = "Missing sender or contact."
@@ -996,6 +1012,25 @@ def _process_due_queue(session: Session, limit: int = 10, draft_ids: list[int] |
                         )
                         session.commit()
                         continue
+                # Final suppression read immediately before the durable attempt
+                # boundary. Later opt-outs cannot recall an in-flight transport.
+                recipient_issues = []
+                for email in dict.fromkeys([contact.email, *_cc_recipients(draft.cc_emails)]):
+                    suppression = _active_suppression_for_email(session, email)
+                    if suppression:
+                        recipient_issues.append(f"Send recipient is in suppression list: {email} ({suppression.reason})")
+                if recipient_issues:
+                    draft.status = "pending_review"
+                    draft.sender_account_id = None
+                    draft.scheduled_at = None
+                    draft.error_message = "; ".join(recipient_issues)
+                    draft.updated_at = utc_now()
+                    session.add(draft)
+                    session.add(EmailEvent(draft_id=draft.id, event_type="pre_send_audit_blocked",
+                                           metadata_json=draft.error_message))
+                    session.commit()
+                    failed += 1
+                    continue
                 draft.status = "sending"
                 draft.error_message = "Delivery attempt started; verify outcome before retrying if interrupted."
                 session.add(draft)

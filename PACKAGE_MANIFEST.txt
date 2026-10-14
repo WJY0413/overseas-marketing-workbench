@@ -1,9 +1,9 @@
-Package: Overseas_Marketing_Workbench_v5.04_Production_Clean
+Package: Overseas_Marketing_Workbench_v5.05_Production_Clean
 Mode: Clean Share
 Includes sample data: True
 Includes LinkedIn sample library: False
 Includes NoGo seed library: False
-Created: 2026-09-29T11:01:01
+Created: 2026-10-14T12:13:29
 Includes .env: False
 Includes local data: False
 Includes saved secret key: False

@@ -48,6 +48,24 @@
           </div>
         </section>
 
+        <section class="panel" id="linkedin-library">
+          <div class="panel-head"><div><h2>LinkedIn 联系人库</h2><p>使用本机内置库，或连接已有的 Workbench LinkedIn SQLite 库。</p></div></div>
+          <p>当前使用：<strong>{{ linkedin_library.label }}</strong></p>
+          <p><code>{{ linkedin_library.path }}</code>{% if not linkedin_library.exists %} · 库文件不存在{% endif %}</p>
+          <form action="/settings/linkedin-library" method="post" class="form-grid">
+            <label>库来源<select name="mode" {% if linkedin_library.locked %}disabled{% endif %}>
+              <option value="native" {% if linkedin_library.mode == 'native' %}selected{% endif %}>内置库</option>
+              <option value="custom" {% if linkedin_library.mode == 'custom' %}selected{% endif %}>指定库路径</option>
+            </select></label>
+            <label>指定库文件的绝对路径<input name="library_path" value="{{ linkedin_library.path if linkedin_library.mode == 'custom' else '' }}" placeholder="例如 D:\LinkedIn\people.sqlite" {% if linkedin_library.locked %}disabled{% endif %} /></label>
+            <button type="submit" {% if linkedin_library.locked %}disabled{% endif %}>检查并切换</button>
+          </form>
+          <p>内置库位置：<code>{{ linkedin_library.native_path }}</code></p>
+          <p>切换仅改变当前读写的库，原库及其历史记录会保留；两库之间不会自动复制或合并联系人。切换后请刷新已打开的建联页面。</p>
+          {% if linkedin_library.locked %}<p>当前库由启动环境变量固定，需修改启动配置后重启此实例。</p>{% endif %}
+          <a class="button secondary" href="/linkedin-library">查看当前联系人库</a>
+        </section>
+
         <section class="panel" id="signature-module">
           <div class="panel-head">
             <div>

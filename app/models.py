@@ -5,9 +5,10 @@ from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.sqlite import DATETIME
 from sqlmodel import Field, SQLModel
 
-from app.time_utils import utc_now
+from app.time_utils import persisted_utc, utc_now
 
 
 def _local_company_id() -> str:
@@ -297,13 +298,24 @@ class FollowUpRule(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class _SuppressionExpiryDateTime(DATETIME):
+    """Retain an explicit UTC offset; old unmarked SQLite values remain naive."""
+    def bind_processor(self, dialect):
+        legacy_processor = super().bind_processor(dialect)
+        def serialize(value):
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                return persisted_utc(value).isoformat(" ", timespec="microseconds")
+            return legacy_processor(value)
+        return serialize
+
+
 class Suppression(SQLModel, table=True):
     __tablename__ = "suppressions"
 
     id: Optional[int] = Field(default=None, sa_column=Column("suppression_id", Integer, primary_key=True))
     email: str = Field(index=True, unique=True)
     reason: str = "blacklist"
-    expires_at: datetime | None = Field(default=None, index=True)
+    expires_at: datetime | None = Field(default=None, sa_column=Column(_SuppressionExpiryDateTime(), index=True))
     created_at: datetime = Field(default_factory=utc_now)
 
 

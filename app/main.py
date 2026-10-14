@@ -87,6 +87,7 @@ from app.services.signatures import (
 from app.services.render_validation import TemplateFieldResolutionError, validate_template_source
 from app.services.templates import render_template
 from app.services.linkedin_connections import LinkedInConnectionError, confirmed_page, confirm as confirm_linkedin_connections, list_candidates as linkedin_candidates, master_library_page, restore_mistag, today_metrics as linkedin_today_metrics
+from app.services.linkedin_library_config import LIBRARY_LOCK, ensure_native_library, library_info, library_token, validate_library
 from app.services.nogo_feedback import send_nogo_feedback
 from app.services.nogo_seed_library import import_internal_nogo_seed
 from app.time_utils import display_dt, local_now, utc_now
@@ -129,6 +130,8 @@ def startup() -> None:
     settings = get_settings()
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     settings.reports_dir.mkdir(parents=True, exist_ok=True)
+    if not getattr(settings, "linkedin_master_sqlite_path", None):
+        ensure_native_library(settings.data_dir / "linkedin_people_master.sqlite")
     create_db_and_tables()
     with Session(engine) as session:
         _clear_startup_workspace(session)
@@ -520,6 +523,12 @@ def _company_cc_emails(session: Session, company_id: int, primary_contact: Conta
 
 
 def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, contact_ids: list[int]) -> dict[str, int]:
+    # Keep selection, rendering and commit in the same boundary as queue intake.
+    with QUEUE_PROCESSING_LOCK:
+        return _generate_drafts_for_contacts_locked(session, template, contact_ids)
+
+
+def _generate_drafts_for_contacts_locked(session: Session, template: EmailTemplate, contact_ids: list[int]) -> dict[str, int]:
     stats = {
         "processed": 0,
         "created": 0,
@@ -560,12 +569,12 @@ def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, con
                 EmailDraft.status.in_(["pending_review", "approved", "queued", "sending", "send_unknown"]),
                 EmailDraft.follow_up_step == 0,
             )
+            .execution_options(populate_existing=True)
         ).first()
         if existing:
-            if existing.status in {"sending", "send_unknown"}:
+            if existing.status in {"queued", "sending", "send_unknown"}:
                 stats["skipped"] += 1
                 continue
-            original_status = existing.status
             refreshed_existing = False
             try:
                 existing.contact_id = contact.id
@@ -582,10 +591,6 @@ def _generate_drafts_for_contacts(session: Session, template: EmailTemplate, con
                 existing.error_message = "; ".join(issues)
                 existing.approved_at = None
                 stats["exceptions"] += 1
-            elif original_status == "queued":
-                existing.status = "queued"
-                existing.error_message = None
-                stats["auto_approved"] += 1
             else:
                 existing.status = "approved"
                 existing.error_message = None
@@ -1141,8 +1146,37 @@ def settings_page(request: Request, message: str = "", session: Session = Depend
             "queue_paused": is_queue_paused(session),
             "signature": _signature_form(signature_config),
             "signature_preview_html": signature_preview_html,
+            "linkedin_library": library_info(get_settings()),
         },
     )
+
+
+@app.post("/settings/linkedin-library")
+def update_linkedin_library(mode: str = Form(...), library_path: str = Form("")):
+    try:
+        with LIBRARY_LOCK:
+            if "LINKEDIN_MASTER_SQLITE_PATH" in os.environ:
+                raise LinkedInConnectionError("库路径由启动环境变量固定，请修改该实例的启动配置后重启。")
+            if mode not in {"native", "custom"}:
+                raise LinkedInConnectionError("请选择内置库或指定路径库。")
+            if mode == "native":
+                path = get_settings().data_dir / "linkedin_people_master.sqlite"
+                ensure_native_library(path)
+                value = '""'
+            else:
+                raw = library_path.strip()
+                if not raw or any(ord(c) < 32 for c in raw):
+                    raise LinkedInConnectionError("请输入有效的库文件绝对路径。")
+                path = Path(raw).expanduser()
+                if not path.is_absolute():
+                    raise LinkedInConnectionError("请填写库文件的绝对路径。")
+                path = path.resolve()
+                value = json.dumps(path.as_posix(), ensure_ascii=False)
+            validate_library(path)
+            _update_env_value("LINKEDIN_MASTER_SQLITE_PATH", value)
+        return _redirect_to("/settings", "LinkedIn 库已切换并保存；原库和历史记录均保留。")
+    except (LinkedInConnectionError, OSError, ValueError) as exc:
+        return _redirect_to("/settings", str(exc))
 
 
 @app.post("/settings/signature")
@@ -1213,20 +1247,21 @@ def linkedin_connections_page(request: Request, message: str = "", query: str = 
         confirmed_data = confirmed_page(settings.linkedin_master_path, query=query, page=page)
     except LinkedInConnectionError as exc:
         candidates, metrics, confirmed_data, message = [], {"people": 0, "batches": 0}, {"records": [], "total": 0, "page": 1, "page_count": 1}, str(exc)
-    return templates.TemplateResponse("linkedin_connections.html", {"request": request, "app_version": APP_VERSION, "message": message, "query": query, "batch_size": batch_size, "candidates": candidates, "metrics": metrics, "confirmed": confirmed_data["records"], "confirmed_total": confirmed_data["total"], "confirmed_page": confirmed_data["page"], "confirmed_page_count": confirmed_data["page_count"]})
+    return templates.TemplateResponse("linkedin_connections.html", {"request": request, "app_version": APP_VERSION, "message": message, "query": query, "batch_size": batch_size, "candidates": candidates, "metrics": metrics, "confirmed": confirmed_data["records"], "confirmed_total": confirmed_data["total"], "confirmed_page": confirmed_data["page"], "confirmed_page_count": confirmed_data["page_count"], "linkedin_library": library_info(settings)})
 
 
 @app.get("/linkedin-library")
 def linkedin_library_page(request: Request, query: str = "", page: int = 1):
+    settings = get_settings()
     try:
-        library = master_library_page(get_settings().linkedin_master_path, query=query, page=page)
+        library = master_library_page(settings.linkedin_master_path, query=query, page=page)
         message = ""
     except LinkedInConnectionError as exc:
         library, message = {"records": [], "total": 0, "page": 1, "page_count": 1}, str(exc)
     return templates.TemplateResponse(
         "linkedin_library.html",
         {"request": request, "app_version": APP_VERSION, "query": query, "message": message,
-         "records": library["records"], "total": library["total"], "page": library["page"], "page_count": library["page_count"]},
+         "records": library["records"], "total": library["total"], "page": library["page"], "page_count": library["page_count"], "linkedin_library": library_info(settings)},
     )
 
 
@@ -1234,8 +1269,13 @@ def linkedin_library_page(request: Request, query: str = "", page: int = 1):
 def confirm_linkedin_connection_batch(request: Request, source_record_ids: list[str] = Form(default=[]), batch_size: int = Form(10)):
     mode = "single" if len(source_record_ids) == 1 else "batch"
     try:
-        result = confirm_linkedin_connections(get_settings().linkedin_master_path, source_record_ids, mode=mode, backup_dir=get_settings().data_dir / "linkedin_backups")
-        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "changed": result["changed"], "mode": mode, "metrics": linkedin_today_metrics(get_settings().linkedin_master_path)})
+        with LIBRARY_LOCK:
+            settings = get_settings()
+            if request.headers.get("x-linkedin-library") != library_token(settings.linkedin_master_path):
+                raise LinkedInConnectionError("当前库已切换或页面已过期，请刷新页面后重试。")
+            result = confirm_linkedin_connections(settings.linkedin_master_path, source_record_ids, mode=mode, backup_dir=settings.data_dir / "linkedin_backups")
+            metrics = linkedin_today_metrics(settings.linkedin_master_path)
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "changed": result["changed"], "mode": mode, "metrics": metrics})
         return _redirect_to("/linkedin-connections", f"Confirmed {len(result['changed'])} LinkedIn connection record(s).")
     except LinkedInConnectionError as exc:
         if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -1245,8 +1285,13 @@ def confirm_linkedin_connection_batch(request: Request, source_record_ids: list[
 @app.post("/linkedin-connections/{source_record_id}/restore")
 def restore_linkedin_mistag(source_record_id: str, request: Request):
     try:
-        restore_mistag(get_settings().linkedin_master_path, source_record_id)
-        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "source_record_id": source_record_id, "metrics": linkedin_today_metrics(get_settings().linkedin_master_path)})
+        with LIBRARY_LOCK:
+            settings = get_settings()
+            if request.headers.get("x-linkedin-library") != library_token(settings.linkedin_master_path):
+                raise LinkedInConnectionError("当前库已切换或页面已过期，请刷新页面后重试。")
+            restore_mistag(settings.linkedin_master_path, source_record_id)
+            metrics = linkedin_today_metrics(settings.linkedin_master_path)
+        if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": True, "source_record_id": source_record_id, "metrics": metrics})
         return _redirect_to("/linkedin-connections", "LinkedIn mistag restored.")
     except LinkedInConnectionError as exc:
         if "application/json" in request.headers.get("accept", ""): return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
@@ -1569,45 +1614,54 @@ def update_draft_prep_contact(
     priority: str = Form("B"),
     session: Session = Depends(get_session),
 ):
-    contact = session.get(Contact, contact_id)
-    if contact is None:
-        return _redirect("Contact not found.")
-    email_check = validate_contact_email(email, check_deliverability=False)
-    normalized_email = email_check.normalized_email or email.strip().lower()
-    if email_check.is_blocking:
-        return _redirect("Please enter a valid email before saving.")
-    existing = session.exec(select(Contact).where(Contact.email == normalized_email, Contact.id != contact_id)).first()
-    if existing:
-        return _redirect("Another CRM contact already uses this email.")
-    company_name = company.strip()
-    previous_company = session.get(Company, contact.company_id)
-    if previous_company and previous_company.name != company_name:
-        has_history = session.exec(select(EmailDraft.id).where(EmailDraft.contact_id == contact.id).limit(1)).first() is not None
-        has_history = has_history or session.exec(select(SendRecord.id).where(SendRecord.contact_id == contact.id).limit(1)).first() is not None
-        if has_history:
-            return _redirect("Contact has draft/send history; resolve company reassignment separately.")
-    if not company_name or not full_name.strip():
-        return _redirect("Company and contact name are required.")
-    company_record = session.exec(select(Company).where(Company.name == company_name)).first()
-    if company_record is None:
-        company_record = Company(name=company_name)
+    # Recipient edits and queue transitions must agree on the same current row.
+    with QUEUE_PROCESSING_LOCK:
+        contact = session.get(Contact, contact_id, populate_existing=True)
+        if contact is None:
+            return _redirect("Contact not found.")
+        email_check = validate_contact_email(email, check_deliverability=False)
+        normalized_email = email_check.normalized_email or email.strip().lower()
+        if email_check.is_blocking:
+            return _redirect("Please enter a valid email before saving.")
+        if normalized_email.casefold() != (contact.email or "").strip().casefold():
+            protected_draft = session.exec(select(EmailDraft.id).where(
+                EmailDraft.contact_id == contact.id,
+                EmailDraft.status.in_(("queued", "sending", "send_unknown")),
+            ).limit(1)).first()
+            if protected_draft is not None:
+                return _redirect("Contact has queued or unresolved delivery. Cancel queued drafts and verify in-flight delivery before changing this email.")
+        existing = session.exec(select(Contact).where(Contact.email == normalized_email, Contact.id != contact_id)).first()
+        if existing:
+            return _redirect("Another CRM contact already uses this email.")
+        company_name = company.strip()
+        previous_company = session.get(Company, contact.company_id)
+        if previous_company and previous_company.name != company_name:
+            has_history = session.exec(select(EmailDraft.id).where(EmailDraft.contact_id == contact.id).limit(1)).first() is not None
+            has_history = has_history or session.exec(select(SendRecord.id).where(SendRecord.contact_id == contact.id).limit(1)).first() is not None
+            if has_history:
+                return _redirect("Contact has draft/send history; resolve company reassignment separately.")
+        if not company_name or not full_name.strip():
+            return _redirect("Company and contact name are required.")
+        company_record = session.exec(select(Company).where(Company.name == company_name)).first()
+        if company_record is None:
+            company_record = Company(name=company_name)
+            session.add(company_record)
+            session.commit()
+            session.refresh(company_record)
+        company_record.country = country.strip() or company_record.country
+        company_record.region = region.strip() or company_record.region
+        company_record.priority = priority.strip() or company_record.priority
+        company_record.updated_at = utc_now()
+        contact.company_id = company_record.id
+        contact.full_name = full_name.strip()
+        contact.first_name = contact.full_name.split(" ")[0]
+        contact.position = position.strip() or None
+        contact.email = normalized_email
+        contact.updated_at = utc_now()
         session.add(company_record)
+        session.add(contact)
+        _sync_primary_email_route(session, contact)
         session.commit()
-        session.refresh(company_record)
-    company_record.country = country.strip() or company_record.country
-    company_record.region = region.strip() or company_record.region
-    company_record.priority = priority.strip() or company_record.priority
-    company_record.updated_at = utc_now()
-    contact.company_id = company_record.id
-    contact.full_name = full_name.strip()
-    contact.first_name = contact.full_name.split(" ")[0]
-    contact.position = position.strip() or None
-    contact.email = normalized_email
-    contact.updated_at = utc_now()
-    session.add(company_record)
-    session.add(contact)
-    _sync_primary_email_route(session, contact)
-    session.commit()
     return _redirect("Draft prep customer updated.")
 
 
@@ -2337,17 +2391,19 @@ def cancel_queue_items(draft_ids: list[int] = Form(default=[]), session: Session
         return _redirect("Please select at least one queued draft to cancel.")
     cancelled = 0
     skipped = 0
-    for draft_id in draft_ids:
-        draft = session.get(EmailDraft, draft_id)
-        if draft is None or draft.status != "queued":
-            skipped += 1
-            continue
-        try:
-            cancel_queued_draft(session, draft)
-            cancelled += 1
-        except ValueError:
-            skipped += 1
-    session.commit()
+    with QUEUE_PROCESSING_LOCK:
+        for draft_id in dict.fromkeys(draft_ids):
+            # A waiting request may have cached a row before the worker sent it.
+            draft = session.get(EmailDraft, draft_id, populate_existing=True)
+            if draft is None or draft.status != "queued":
+                skipped += 1
+                continue
+            try:
+                cancel_queued_draft(session, draft)
+                cancelled += 1
+            except ValueError:
+                skipped += 1
+        session.commit()
     sync_power_awake(session)
     return _redirect(f"Cancelled queued draft(s): {cancelled}. Skipped: {skipped}.")
 
@@ -2355,7 +2411,8 @@ def cancel_queue_items(draft_ids: list[int] = Form(default=[]), session: Session
 @app.post("/queue/cancel-all")
 def cancel_all_queue(session: Session = Depends(get_session)):
     with QUEUE_PROCESSING_LOCK:
-        drafts = session.exec(select(EmailDraft).where(EmailDraft.status == "queued")).all()
+        drafts = session.exec(select(EmailDraft).where(EmailDraft.status == "queued")
+                              .execution_options(populate_existing=True)).all()
         for draft in drafts:
             cancel_queued_draft(session, draft)
         handoffs = session.exec(select(QueueHandoffRun).where(QueueHandoffRun.status.in_(("pending", "running")))).all()

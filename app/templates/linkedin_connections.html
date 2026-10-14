@@ -3,6 +3,7 @@
 <body><main class="shell">{% include "_nav.html" %}<section class="content">
   <header class="topbar"><div><h1>LinkedIn 建联</h1><p>LinkedIn 联系人主库；每批展示 {{ batch_size }} 位待建联联系人。</p></div><a class="button secondary" href="/">返回工作台</a></header>
   {% if message %}<div class="notice">{{ message }}</div>{% endif %}
+  <p>当前库：<strong>{{ linkedin_library.label }}</strong> · <code>{{ linkedin_library.path }}</code> · <a href="/settings#linkedin-library">库设置</a></p>
   <section class="metrics"><div class="metric"><span>今日已确认建联</span><strong id="dashboard-people">{{ metrics.people }} 人</strong></div></section>
         <section class="panel">
           <form method="get" action="/linkedin-connections" class="form-grid">
@@ -19,6 +20,7 @@
   <section class="panel"><h2>已确认记录</h2><small>共 {{ confirmed_total }} 条；第 {{ confirmed_page }} / {{ confirmed_page_count }} 页，每页 10 条。</small><div class="table-wrap"><table><thead><tr><th>人名</th><th>公司</th><th>职位</th><th>打招呼信息</th><th>状态</th><th>操作</th></tr></thead><tbody>{% for person in confirmed %}<tr><td>{{ person.name }}</td><td>{{ person.company }}</td><td>{{ person.position }}</td><td>{{ person.greeting }}</td><td>{{ person.status }}</td><td>{% if person.can_restore %}<button class="restore-confirmed secondary" type="button" data-source-record-id="{{ person.source_record_id }}">撤销误标</button>{% else %}-{% endif %}</td></tr>{% else %}<tr><td colspan="6">暂无已确认记录。</td></tr>{% endfor %}</tbody></table></div>{% if confirmed_page_count > 1 %}<div class="inline-actions">{% if confirmed_page > 1 %}<a class="button secondary" href="/linkedin-connections?query={{ query|urlencode }}&batch_size={{ batch_size }}&page={{ confirmed_page - 1 }}">上一页</a>{% endif %}<span>第 {{ confirmed_page }} / {{ confirmed_page_count }} 页</span>{% if confirmed_page < confirmed_page_count %}<a class="button secondary" href="/linkedin-connections?query={{ query|urlencode }}&batch_size={{ batch_size }}&page={{ confirmed_page + 1 }}">下一页</a>{% endif %}</div>{% endif %}</section>
 </section></main>    <script id="candidate-source-record-ids" type="application/json">{{ candidates | map(attribute='source_record_id') | list | tojson }}</script>
     <script>
+      const libraryToken = {{ linkedin_library.token | tojson }};
       const batchSize = {{ batch_size | tojson }};
       const candidateIds = JSON.parse(document.getElementById("candidate-source-record-ids").textContent);
       const feedback = document.getElementById("linkedin-feedback");
@@ -41,12 +43,12 @@
         const unconfirmed = ids.filter((id) => !document.getElementById(`candidate-${id}`)?.classList.contains("linkedin-confirmed-row"));
         if (!unconfirmed.length) return;
         const body = new URLSearchParams({ batch_size: batchSize }); unconfirmed.forEach((id) => body.append("source_record_ids", id));
-        const response = await fetch("/linkedin-connections/confirm", { method: "POST", headers: { "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" }, body });
+        const response = await fetch("/linkedin-connections/confirm", { method: "POST", headers: { "X-LinkedIn-Library": libraryToken, "Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded" }, body });
         const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || "确认失败"); updateMetrics(result.metrics); markConfirmed(result.changed, mode);
       }
       async function restoreRecord(row) {
         const id = row.dataset.sourceRecordId;
-        const response = await fetch(`/linkedin-connections/${encodeURIComponent(id)}/restore`, { method: "POST", headers: { "Accept": "application/json" } });
+        const response = await fetch(`/linkedin-connections/${encodeURIComponent(id)}/restore`, { method: "POST", headers: { "X-LinkedIn-Library": libraryToken, "Accept": "application/json" } });
         const result = await response.json(); if (!response.ok || !result.ok) throw new Error(result.error || "还原失败");
         row.classList.remove("linkedin-confirmed-row");
         const checkbox = row.querySelector(".single-confirm"); checkbox.checked = false; checkbox.disabled = false;
@@ -82,7 +84,7 @@
         if (busy) return;
         setBusy(true);
         try {
-          const response = await fetch(`/linkedin-connections/${encodeURIComponent(button.dataset.sourceRecordId)}/restore`, { method: "POST", headers: { "Accept": "application/json" } });
+          const response = await fetch(`/linkedin-connections/${encodeURIComponent(button.dataset.sourceRecordId)}/restore`, { method: "POST", headers: { "X-LinkedIn-Library": libraryToken, "Accept": "application/json" } });
           const result = await response.json();
           if (!response.ok || !result.ok) throw new Error(result.error || "还原失败");
           updateMetrics(result.metrics);
