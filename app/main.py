@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import re
@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -88,7 +89,7 @@ from app.services.render_validation import TemplateFieldResolutionError, validat
 from app.services.templates import render_template
 from app.services.linkedin_connections import LinkedInConnectionError, confirmed_page, confirm as confirm_linkedin_connections, list_candidates as linkedin_candidates, master_library_page, restore_mistag, today_metrics as linkedin_today_metrics
 from app.services.linkedin_library_config import LIBRARY_LOCK, ensure_native_library, library_info, library_token, validate_library
-from app.services.nogo_feedback import send_nogo_feedback
+from app.services.nogo_feedback import build_nogo_feedback
 from app.services.nogo_seed_library import import_internal_nogo_seed
 from app.time_utils import display_dt, local_now, utc_now
 from app.version import APP_VERSION
@@ -1044,18 +1045,9 @@ def signature_preview(
 
 
 @app.get("/senders")
-def senders_page(request: Request, message: str = "", session: Session = Depends(get_session)):
-    return templates.TemplateResponse(
-        "senders.html",
-        {
-            "request": request,
-            "settings": get_settings(),
-            "app_version": APP_VERSION,
-            "message": message,
-            "sender_usage": _sender_usage(session),
-            "default_recommended_daily_limit": DEFAULT_RECOMMENDED_DAILY_LIMIT,
-        },
-    )
+def senders_page(message: str = ""):
+    query = "?" + urlencode({"message": message}) if message else ""
+    return RedirectResponse(f"/settings{query}#sender-accounts", status_code=303)
 
 
 @app.get("/send-records")
@@ -1422,13 +1414,15 @@ async def import_no_go_company_list(
     )
 
 
-@app.post("/crm/no-go/feedback")
-def send_no_go_feedback(session: Session = Depends(get_session)):
-    try:
-        result = send_nogo_feedback(session)
-    except ValueError as exc:
-        return _redirect_to("/crm", str(exc))
-    return _redirect_to("/crm", f"NO-GO 反馈已{ '演练生成' if result['status'] == 'dry_run' else '发送' }：{result['count']} 条；默认第一发件邮箱 {result['sender']}。不计入营销日额度。")
+@app.get("/crm/no-go/export")
+@app.post("/crm/no-go/feedback", include_in_schema=False)
+def export_no_go_feedback(session: Session = Depends(get_session)):
+    # The old POST URL also downloads a file; it can never send an email.
+    filename = f"nogo-feedback-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    return JSONResponse(build_nogo_feedback(session), headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    })
 
 
 @app.get("/rules")

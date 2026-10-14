@@ -55,7 +55,7 @@
             </label>
             <button type="submit">导入并设为 NO-GO</button>
           </form>
-          <form action="/crm/no-go/feedback" method="post"><button class="secondary" type="submit">一键反馈NO-GO增量</button><small>默认使用第一个已配置发件邮箱发送至你配置的反馈邮箱；不计入营销日发送额度。附件分开列出公司 NO-GO 与具体退信邮箱，不扩展为域名级屏蔽；不含联系人、邮件历史或凭据。</small></form>
+          <p><a class="button secondary" href="/crm/no-go/export">下载 NO-GO 反馈文件</a><small>导出当前反馈快照，分开列出公司 NO-GO、有效退信邮箱和原有域名汇总；不发送邮件，不修改抑制规则或历史记录。</small></p>
 
           <form method="get" action="/crm" class="form-grid"><input type="hidden" name="library" value="{{ library }}" /><label>查询 NO-GO 公司<input name="no_go_query" value="{{ no_go_query }}" placeholder="输入完整或部分公司名" /></label><button class="secondary" type="submit">查询</button></form>
           <div class="table-wrap">

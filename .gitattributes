@@ -1,0 +1,2 @@
+*.sh text eol=lf
+.env.linux.example text eol=lf

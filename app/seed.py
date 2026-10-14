@@ -1,7 +1,7 @@
 from sqlmodel import Session, select
 
 from app.db import engine
-from app.models import EmailTemplate, FollowUpRule
+from app.models import EmailTemplate
 
 
 def seed_defaults() -> None:
@@ -56,7 +56,3 @@ def seed_defaults() -> None:
             session.add(follow_up)
             session.commit()
             session.refresh(follow_up)
-
-        if session.exec(select(FollowUpRule)).first() is None:
-            session.add(FollowUpRule(name="No reply after 3 days", delay_days=3, template_id=follow_up.id))
-        session.commit()

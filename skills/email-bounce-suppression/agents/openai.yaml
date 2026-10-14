@@ -1,4 +1,0 @@
-interface:
-  display_name: "Email Bounce Suppression"
-  short_description: "Scan mailbox bounces and suppress bad email routes."
-  default_prompt: "Use $email-bounce-suppression to inspect BD Email Workbench bounce mail and remove bounced email routes without deleting companies."

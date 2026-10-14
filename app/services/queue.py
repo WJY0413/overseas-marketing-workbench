@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 from app.config import get_settings
 from app.models import Company, Contact, EmailDraft, EmailEvent, EmailTemplate, QueueHandoffRun, SendRecord, SenderAccount, Suppression
 from app.services.email_quality import validate_contact_email
-from app.services.feishu_native_reply import is_native_reply_draft, native_reply_metadata, send_queued_native_reply
+from app.services.feishu_native_reply import NATIVE_REPLY_RETIRED, is_native_reply_draft, native_reply_metadata, send_queued_native_reply
 from app.services.app_settings import is_queue_paused, set_app_setting
 from app.services.mailer import send_draft
 from app.services.delivery_outcome import DeliveryUncertainError
@@ -203,13 +203,12 @@ def sanitize_cc_once(session: Session, draft: EmailDraft) -> list[dict[str, str]
 
 
 def _company_blocks_draft(company: Company, draft: EmailDraft) -> bool:
-    # A reply ends cold outreach, but does not forbid an explicitly prepared reply.
-    if is_native_reply_draft(draft.template_snapshot) and company.status == "replied" and not company.is_blacklisted:
-        return False
     return is_no_go_company(company)
 
 
 def audit_draft(session: Session, draft: EmailDraft) -> list[str]:
+    if is_native_reply_draft(draft.template_snapshot):
+        return [NATIVE_REPLY_RETIRED]
     contact = session.get(Contact, draft.contact_id)
     company = session.get(Company, draft.company_id)
     issues: list[str] = []
@@ -611,6 +610,8 @@ def _queue_draft_locked(
     sender = session.get(SenderAccount, sender_id)
     if draft is None or sender is None:
         raise ValueError("Draft or sender not found.")
+    if is_native_reply_draft(draft.template_snapshot):
+        raise ValueError(NATIVE_REPLY_RETIRED)
     if draft.status != "approved":
         raise ValueError("Draft must be marked handled before queuing.")
     if not sender.is_active:

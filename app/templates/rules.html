@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
@@ -35,8 +35,9 @@
             <button type="submit">保存双计数器节奏</button>
           </form>
         </section>
-        <section class="panel">
-          <h2>旧版固定延迟规则</h2>
+        {% if rules %}
+        <details class="panel" id="legacy-followup-history">
+          <summary>旧版规则历史（{{ rules | length }} 条，仅供审计）</summary>
           <p>已退役且不会再运行；保留以下历史记录仅供审计。新建或编辑必须使用双计数器规则。</p>
           <div class="table-wrap">
             <table>
@@ -48,7 +49,8 @@
               </tbody>
             </table>
           </div>
-        </section>
+        </details>
+        {% endif %}
       </section>
     </main>
   </body>
