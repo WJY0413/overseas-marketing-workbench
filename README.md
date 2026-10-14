@@ -1,5 +1,16 @@
 # BD Email Workbench
 
+## 按平台下载安装
+
+| 平台 | 版本 | 下载 |
+| --- | --- | --- |
+| Windows | 5.05 | [正式安装包](https://github.com/WJY0413/overseas-marketing-workbench/releases/download/v5.05/Overseas_Marketing_Workbench_v5.05_Production_Clean.zip) · [发布说明](https://github.com/WJY0413/overseas-marketing-workbench/releases/tag/v5.05) |
+| Linux / dot | 5.05 / linux-dot.1 | [Linux 安装包](https://github.com/WJY0413/overseas-marketing-workbench/releases/download/v5.05-linux-dot.1/Overseas_Marketing_Workbench_v5.05_Linux_Dot_v1.tar.gz) · [发布说明](https://github.com/WJY0413/overseas-marketing-workbench/releases/tag/v5.05-linux-dot.1) |
+
+Linux / dot 用户请使用对应安装包和 [Linux 安装指南](https://github.com/WJY0413/overseas-marketing-workbench/releases/download/v5.05-linux-dot.1/LINUX_DOT.md)，也可把 [部署提示词](https://github.com/WJY0413/overseas-marketing-workbench/releases/download/v5.05-linux-dot.1/DOT_DEPLOY_PROMPT.txt) 交给 dot 执行独立空库安装测试。Linux 版已退役内置飞书原生回复、统一发件设置、折叠旧规则，并将 NO-GO 反馈改为 JSON 下载。实际 dot 环境仍需验证持久化和常驻能力；初始安装仅允许模拟发送。
+
+[全部历史版本](https://github.com/WJY0413/overseas-marketing-workbench/releases)继续保留。请下载对应发布资产，不要用 GitHub 自动生成的 Source code 压缩包替代安装包。本分支及下方说明对应 Windows 版；Linux 源码位于 `v5.05-linux-dot.1` 标签。
+
 ## LinkedIn 库选择（5.05）
 
 在「设置 → LinkedIn 联系人库」选择「内置库」或「指定库路径」。内置库位于当前数据目录的 `linkedin_people_master.sqlite`；新安装会自动创建空库，已有库完整保留。内部种子包已有的联系人库仍可继续使用。
